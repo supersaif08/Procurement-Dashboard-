@@ -2,7 +2,7 @@
   "name": "boq-workflow-app",
   "private": true,
   "type": "module",
-  "homepage": "https://supersaif08.github.io/hackathon",
+  "homepage": "https://supersaif08.github.io/Procurement-Dashboard-",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
