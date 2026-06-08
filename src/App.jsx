@@ -1,6 +1,8 @@
 import { useState, useRef, useMemo, useEffect } from "react";
 import * as XLSX from "xlsx";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Cell } from "recharts";
+import { supabase } from "./supabaseClient";
+import { createClient } from "@supabase/supabase-js";
 
 const G = `
   @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=Sora:wght@400;600;700;800&display=swap');
@@ -53,7 +55,7 @@ const ROLE_PAGES = {
 };
 const PAGE_LABELS = {
   dashboard:"Dashboard", create:"Create BOQ", "my-boqs":"My BOQs / All BOQs",
-  pending:"Pending Review", reports:"Reports", procurement:"Procurement Tracker",
+  pending:"Pending Approvals", reports:"Reports", procurement:"Procurement Tracker",
 };
 
 const INITIAL_USERS = [
@@ -69,6 +71,7 @@ const INITIAL_USERS = [
 const mkInitials = n => n.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
 
 const ROLE_META = {
+  admin:       { label:"Administrator",        color:"#ec4899", icon:"👑" },
   planning:    { label:"Project Control",      color:"var(--plan)", icon:"📐" },
   engineering: { label:"Engineering Team",     color:"var(--eng)", icon:"⚙️" },
   qs:          { label:"Quantity Survey Team", color:"var(--qs)", icon:"📏" },
@@ -77,230 +80,7 @@ const ROLE_META = {
   vendor:      { label:"Vendor",               color:"var(--vendor)", icon:"🏭" },
 };
 
-const STATUS_META = {
-  draft:           { label:"Draft",                color:"var(--muted)", bg:"var(--bg-draft)" },
-  with_engineering:{ label:"With Engineering",     color:"var(--eng)", bg:"var(--bg-eng)" },
-  with_qs:         { label:"With Quantity Survey", color:"var(--qs)", bg:"var(--bg-qs)" },
-  with_site:       { label:"With Project Team",    color:"var(--site)", bg:"var(--bg-site)" },
-  completed:       { label:"Completed",            color:"var(--accent)", bg:"var(--bg-comp)" },
-};
 
-const UNIT_LIST = ["No's","Nos","Sets","R.Mtrs","Mtrs.","Mts","L/S","M.Ton","Cu. Mtrs","Sq.Mtr","MT","KG","CFT","SQM","LTR","Bags","RM","Sqft","RMT","Lump","LS","Lot","KVA","KW","Mtr"];
-const genId = () => `BOQ-${Date.now().toString(36).toUpperCase().slice(-6)}`;
-
-// ─── Excel Parser ─────────────────────────────────────────────────────────────
-
-// Maps a cell header text → recognised field key. Returns null if unrecognised.
-function classifyHeader(raw) {
-  const h = String(raw ?? '').toLowerCase().replace(/[^a-z0-9]/g, ' ').trim();
-  if (!h) return null;
-  // Line item / serial number column
-  if (/line.?item.?id|item.?id|line.?id|sl\s*no|s\s*no|sr\s*no|si\s*no/.test(h)) return 'lineItemId';
-  // Label / section code
-  if (/^(label|code|ref|section|heading|item\s*no|item\s*num)$/.test(h)) return 'label';
-  // Description / name column
-  if (/descrip|item\s*desc|item\s*name|particulars|work\s*description|scope|narration/.test(h)) return 'name';
-  // Unit column
-  if (/^(unit|uom|units)$/.test(h) || /unit\s*of\s*measure/.test(h)) return 'unit';
-  // Quantity column — only exact matches to avoid "3rd FLOOR QUANTITY" style merged headers
-  if (/^(qty|quantity|quant)$/.test(h)) return 'quantity';
-  return null;
-}
-
-// Count distinct recognised headers in a row
-function headerScore(row) {
-  const seen = new Set();
-  for (const cell of row) { const f = classifyHeader(cell); if (f) seen.add(f); }
-  return seen.size;
-}
-
-// Build column-index map from a header row
-function buildColMap(row) {
-  const map = {};
-  row.forEach((cell, ci) => {
-    const f = classifyHeader(cell);
-    if (f && !(f in map)) map[f] = ci;
-  });
-  return map;
-}
-
-// Clean a lineItemId that Excel may have stored as a float
-// e.g. "1.2000000000000002" → "1.2"
-function cleanLineItemId(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return '';
-  const n = parseFloat(s);
-  if (!isNaN(n)) return parseFloat(n.toPrecision(10)).toString();
-  return s;
-}
-
-// Key rule: a row is a "spec / note" row if it has text only in the description
-// column and nothing else meaningful (no line-item id, no unit, no qty).
-// These are background paragraphs that explain the items below them — NOT line items.
-// Parse ALL sheets — returns array of {sheetName, items}
-function parseAllSheets(wb) {
-  return wb.SheetNames.map(name => ({
-    sheetName: name,
-    items: trySheet(wb.Sheets[name]),
-  }));
-}
-
-// Legacy single-best-sheet picker (kept for non-multi-sheet paths)
-function parseSheetToItems(wb) {
-  let best = [];
-  for (const s of wb.SheetNames) {
-    const r = trySheet(wb.Sheets[s]);
-    if (r.length > best.length) best = r;
-  }
-  return best;
-}
-
-function trySheet(sheet) {
-  const rows = XLSX.utils.sheet_to_json(sheet, { header:1, defval:'', raw:false, blankrows:false });
-  if (!rows || rows.length < 2) return [];
-
-  // ── Step 1: Find the headline row ──────────────────────────────────────────
-  // Scan the first 40 rows. The row with the most recognised column keywords
-  // (Description, Unit, Qty, SI. NO …) is the column-header / headline row.
-  // ALL data extraction happens from the row immediately after it.
-  let bestRow = -1, bestScore = 0, bestMap = {};
-  for (let i = 0; i < Math.min(40, rows.length); i++) {
-    const map = buildColMap(rows[i]);
-    const score = Object.keys(map).length;
-    if (score > bestScore) { bestScore = score; bestRow = i; bestMap = map; }
-  }
-
-  const cm = { ...bestMap };
-  // dataStart = first row of actual items (one row after the headline)
-  const dataStart = bestScore > 0 ? bestRow + 1 : 0;
-
-  // ── Step 2: Heuristically find the description column if not in headline ────
-  if (!('name' in cm)) {
-    const textScore = {};
-    for (let i = dataStart; i < Math.min(dataStart + 60, rows.length); i++) {
-      (rows[i] || []).forEach((cell, ci) => {
-        const v = String(cell).trim();
-        // Must be long text that is NOT a number
-        if (v.length > 5 && isNaN(parseFloat(v.replace(/,/g, '')))) {
-          textScore[ci] = (textScore[ci] || 0) + v.length;
-        }
-      });
-    }
-    const taken = new Set(Object.values(cm));
-    const best = Object.entries(textScore)
-      .filter(([ci]) => !taken.has(Number(ci)))
-      .sort((a, b) => b[1] - a[1])[0];
-    if (best) cm.name = Number(best[0]);
-  }
-
-  if (!('name' in cm)) return []; // no description column found at all
-
-  // ── Step 3: Heuristically find quantity column ──────────────────────────────
-  // Prefer columns with small positive integers (1–9999 = typical BOQ counts)
-  // over columns with large numbers (rates / costs).
-  // Also prefer columns physically close to the unit column.
-  if (!('quantity' in cm)) {
-    const taken = new Set(Object.values(cm));
-    const qtyHits = {}, rateHits = {};
-    for (let i = dataStart; i < Math.min(dataStart + 60, rows.length); i++) {
-      (rows[i] || []).forEach((cell, ci) => {
-        if (taken.has(ci)) return;
-        const v = parseFloat(String(cell).replace(/,/g, '').trim());
-        if (isNaN(v) || v <= 0) return;
-        if (v <= 9999) qtyHits[ci] = (qtyHits[ci] || 0) + 1;
-        else           rateHits[ci] = (rateHits[ci] || 0) + 1;
-      });
-    }
-    const unitCol = cm.unit ?? 999;
-    const cands = Object.entries(qtyHits)
-      .filter(([ci]) => !taken.has(Number(ci)) && !(rateHits[Number(ci)] > qtyHits[Number(ci)]))
-      .sort((a, b) => Math.abs(Number(a[0]) - unitCol) - Math.abs(Number(b[0]) - unitCol));
-    if (cands.length) cm.quantity = Number(cands[0][0]);
-  }
-
-  // ── Step 4: Heuristically find unit column ──────────────────────────────────
-  const UR = /^(nos?\.?|no's|sets?|r\.?mtrs?|mtr?s?\.?|mts|l\/s|m\.?ton|cu\.?\s*mtr?s?|sq\.?\s*mtr?|mt|kg|cft|sqm|ltr?|bags|rm|rmt|lump|ls|lot|kva|kw|pcs|ea|each|m|km|units?)$/i;
-  if (!('unit' in cm)) {
-    const taken = new Set(Object.values(cm));
-    const unitHits = {};
-    for (let i = dataStart; i < Math.min(dataStart + 60, rows.length); i++) {
-      (rows[i] || []).forEach((cell, ci) => {
-        if (taken.has(ci)) return;
-        const v = String(cell).trim();
-        if (v.length >= 1 && v.length <= 12 && UR.test(v)) unitHits[ci] = (unitHits[ci] || 0) + 1;
-      });
-    }
-    const best = Object.entries(unitHits).sort((a, b) => b[1] - a[1])[0];
-    if (best && Number(best[1]) >= 2) cm.unit = Number(best[0]);
-  }
-
-  // ── Step 5: Extract rows — DESCRIPTION IS THE ONLY REQUIRED FIELD ──────────
-  //
-  // Simple two-rule logic:
-  //   KEEP  → description column has any text  (other fields may be blank)
-  //   SKIP  → description column is empty      (even if other columns have data)
-  //
-  // The only other rows we skip are structural noise that will never have
-  // a real description:
-  //   • Completely blank rows
-  //   • Repeated column-header rows (score ≥ 2 recognised field keywords)
-  //   • Sub-header continuation rows where every cell is a rate/amount keyword
-  //     e.g. "QUANTITY | Rate (INR) | Amount (INR)"
-  //   • Aggregate summary rows: SUB TOTAL, GRAND TOTAL, TOTAL
-
-  // Matches rows like "SUB TOTAL", "GRAND TOTAL", "TOTAL"
-  const IS_TOTAL_ROW = /^(sub\s*total|grand\s+total|^total$)/i;
-
-  // Words that appear in sub-header continuation rows only (not in real descriptions)
-  const IS_META_HEADER = /^(quantity|rate|amount|price|cost|inr|rs\.?|supply|installation|total|uom|unit\s*of\s*measure|floor|section)$/i;
-
-  const items = [];
-  let uid = Date.now();
-
-  for (let i = dataStart; i < rows.length; i++) {
-    const row = rows[i];
-
-    // Skip blank rows
-    if (!row || row.every(c => String(c).trim() === '')) continue;
-
-    // Skip repeated column-header rows (e.g. headline appears again mid-sheet)
-    if (headerScore(row) >= 2) continue;
-
-    // Skip sub-header continuation rows where every non-empty cell is a meta word
-    const nonEmpty = row.map(c => String(c).trim()).filter(Boolean);
-    if (nonEmpty.length > 0 && nonEmpty.every(v =>
-      IS_META_HEADER.test(v.toLowerCase().replace(/[^a-z]/g, ' ').trim())
-    )) continue;
-
-    // ── The anchor: description column ───────────────────────────────────────
-    const rawName = String(row[cm.name] ?? '').trim();
-
-    // SKIP if description is empty — regardless of what other columns contain
-    if (!rawName) continue;
-
-    // Skip aggregate/total rows (they have text in description but aren't items)
-    if (IS_TOTAL_ROW.test(rawName)) continue;
-
-    // ✅ Description present → extract whatever other fields are available.
-    //    Missing lineItemId / unit / qty are fine — leave them blank / zero.
-    const lineItemId = cm.lineItemId != null ? cleanLineItemId(row[cm.lineItemId]) : '';
-    const unit       = cm.unit       != null ? String(row[cm.unit]       ?? '').trim() : '';
-    const label      = cm.label      != null ? String(row[cm.label]      ?? '').trim() : '';
-    const planQty    = cm.quantity   != null ? pn(String(row[cm.quantity] ?? ''))      : 0;
-
-    items.push({ id: uid++, lineItemId, label, name: rawName, unit, planQty, engQty:0, qsQty:0, siteQty:0 });
-  }
-
-  return items;
-}
-
-function pn(str){const n=parseFloat(String(str).replace(/,/g,'').trim());return isNaN(n)?0:n;}
-
-// ─── UI Primitives ────────────────────────────────────────────────────────────
-function Badge({status}){
-  const m=STATUS_META[status]||{label:status,color:"var(--muted)",bg:"var(--bg-draft)"};
-  return <span style={{background:m.bg,color:m.color,border:`1px solid var(--border)`,borderRadius:20,padding:"3px 10px",fontSize:11,fontWeight:600,whiteSpace:"nowrap"}}>{m.label}</span>;
-}
 function Btn({children,variant="primary",onClick,disabled,small,style={}}){
   const v={
     primary:{background:"var(--accent)",color:"#fff"},
@@ -322,379 +102,54 @@ function StatCard({icon,label,value,color}){
     </div>
   );
 }
-function DiffBadge({diff,show}){
-  if(!show) return <span style={{color:"var(--muted)"}}>—</span>;
-  const c=diff===0?"var(--green)":diff>0?"var(--amber)":"var(--red)";
-  return <span style={{fontSize:12,fontWeight:700,color:c,background:"var(--s3)",border:`1px solid var(--border)`,borderRadius:20,padding:"3px 9px",whiteSpace:"nowrap"}}>{diff>0?"+":""}{diff}</span>;
-}
-function DescCell({text,editable,onChange}){
-  if(!editable) return <div style={{lineHeight:1.75,fontSize:13,whiteSpace:"pre-wrap",wordBreak:"break-word",color:"var(--text)",padding:"2px 0"}}>{text||<span style={{color:"var(--muted)"}}>—</span>}</div>;
-  return(
-    <div contentEditable suppressContentEditableWarning
-      onBlur={e=>onChange(e.currentTarget.innerText.trim())}
-      onFocus={e=>e.currentTarget.style.borderColor="var(--accent)"}
-      onBlurCapture={e=>e.currentTarget.style.borderColor="var(--border)"}
-      style={{minHeight:38,lineHeight:1.75,fontSize:13,padding:"6px 10px",background:"var(--s3)",border:"1px solid var(--border)",borderRadius:8,outline:"none",whiteSpace:"pre-wrap",wordBreak:"break-word",cursor:"text"}}
-    >{text}</div>
-  );
-}
 
-// ─── Notification Bell ────────────────────────────────────────────────────────
-function NotifBell({notifications,onClear}){
-  const [open,setOpen]=useState(false);
-  const unread=notifications.filter(n=>!n.read).length;
-  return(
-    <div style={{position:"relative"}}>
-      <button onClick={()=>setOpen(o=>!o)} style={{background:"none",border:"none",fontSize:20,position:"relative",padding:"4px 8px",color:"var(--text)"}}>
-        🔔
-        {unread>0&&<span className="pulse" style={{position:"absolute",top:0,right:0,width:18,height:18,background:"var(--red)",borderRadius:"50%",fontSize:10,fontWeight:700,color:"#fff",display:"flex",alignItems:"center",justifyContent:"center"}}>{unread}</span>}
-      </button>
-      {open&&(
-        <div style={{position:"absolute",right:0,top:40,width:360,background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,zIndex:999,boxShadow:"0 8px 32px rgba(0,0,0,.5)"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 16px",borderBottom:"1px solid var(--border)"}}>
-            <span style={{fontWeight:600,fontSize:14}}>Notifications</span>
-            {unread>0&&<button onClick={()=>{onClear();setOpen(false);}} style={{background:"none",border:"none",color:"var(--accent)",fontSize:12,cursor:"pointer"}}>Mark all read</button>}
-          </div>
-          <div style={{maxHeight:340,overflowY:"auto"}}>
-            {notifications.length===0&&<div style={{padding:"24px 16px",color:"var(--muted)",fontSize:13,textAlign:"center"}}>No notifications</div>}
-            {notifications.slice().reverse().map(n=>(
-              <div key={n.id} style={{padding:"12px 16px",borderBottom:"1px solid var(--border)",background:n.read?"transparent":"#1e293b",display:"flex",gap:12,alignItems:"flex-start"}}>
-                <span style={{fontSize:18,flexShrink:0}}>{n.icon}</span>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:13,fontWeight:n.read?400:600,lineHeight:1.5,wordBreak:"break-word",whiteSpace:"pre-wrap"}}>{n.message}</div>
-                  <div style={{fontSize:11,color:"var(--muted)",marginTop:3}}>{new Date(n.time).toLocaleString()}</div>
-                </div>
-                {!n.read&&<div style={{width:8,height:8,borderRadius:"50%",background:"var(--accent)",flexShrink:0,marginTop:4}}/>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Items Table ──────────────────────────────────────────────────────────────
-// Columns rendered depend on role and which stages are available
-function ItemsTable({items, role, editField, onUpdateItem, stagesVisible, lastRowRef=null}){
-  // stagesVisible: { eng, qs, site }
-  const {eng=false, qs=false, site=false} = stagesVisible||{};
-  const isPlan = role==="planning";
-  const isEng  = role==="engineering";
-  const isQS   = role==="qs";
-  const isSite = role==="site";
-  const canEditPlan = isPlan && editField==="planQty";
-
-  // ── Item search ─────────────────────────────────────────────────────────────
-  const [search,setSearch]=useState("");
-  // "all" | "description" | "lineItemId" | "label"
-  const [searchField,setSearchField]=useState("all");
-  const q=search.trim().toLowerCase();
-  const filteredItems=q
-    ? items.filter(i=>{
-        if(searchField==="description") return i.name&&i.name.toLowerCase().includes(q);
-        if(searchField==="lineItemId")  return i.lineItemId&&i.lineItemId.toLowerCase().includes(q);
-        if(searchField==="label")       return i.label&&i.label.toLowerCase().includes(q);
-        // "all" — search across every field
-        const qtyRole=editField==="engQty"?i.engQty:editField==="qsQty"?i.qsQty:editField==="siteQty"?i.siteQty:i.planQty;
-        return(
-          (i.name&&i.name.toLowerCase().includes(q))||
-          (i.lineItemId&&i.lineItemId.toLowerCase().includes(q))||
-          (i.label&&i.label.toLowerCase().includes(q))||
-          (i.unit&&i.unit.toLowerCase().includes(q))||
-          String(i.planQty||0).includes(q)||
-          String(qtyRole||0).includes(q)
-        );
-      })
-    : items;
-  const FIELD_OPTS=[
-    {k:"all",         label:"All Fields"},
-    {k:"description", label:"Description"},
-    {k:"lineItemId",  label:"Line Item ID"},
-    {k:"label",       label:"Label"},
-  ];
-  const placeholders={
-    all:"Search description, line ID, label, unit, qty…",
-    description:"Search item description…",
-    lineItemId:"Search line item ID…",
-    label:"Search label…",
-  };
-
-  // Auto-hide optional columns when all items have no data for that field
-  // In edit mode always show so user can fill them in
-  const hasLineItemId = canEditPlan || items.some(i=>i.lineItemId&&i.lineItemId.trim());
-  const hasLabel      = canEditPlan || items.some(i=>i.label&&i.label.trim());
-  const hasUnit       = canEditPlan || items.some(i=>i.unit&&i.unit.trim());
-
-  // Determine which qty columns to show per role
-  const showEng  = isEng||isQS||isSite||(isPlan&&eng);
-  const showQS   = isQS||isSite||(isPlan&&qs);
-  const showSite = isSite||(isPlan&&site);
-
-  // Min table width based on visible columns
-  let minW = 400;
-  if(hasLineItemId) minW+=110;
-  if(hasLabel)      minW+=100;
-  if(hasUnit)       minW+=80;
-  minW+=100+50; // planQty col + # col
-  if(showEng)  minW+=190;
-  if(showQS)   minW+=190;
-  if(showSite) minW+=190;
-
-  return(
-    <div>
-      {/* ── Search bar + field filter ── */}
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12,flexWrap:"wrap"}}>
-        {/* Field filter chips */}
-        <div style={{display:"flex",gap:4,flexShrink:0}}>
-          {FIELD_OPTS.map(opt=>{
-            const active=searchField===opt.k;
-            const chipColor=opt.k==="description"?"var(--accent)":opt.k==="lineItemId"?"var(--plan)":opt.k==="label"?"var(--qs)":"var(--muted)";
-            return(
-              <button key={opt.k} onClick={()=>setSearchField(opt.k)}
-                style={{padding:"4px 11px",fontSize:11,fontWeight:600,borderRadius:20,border:`1px solid ${active?chipColor:"var(--border)"}`,
-                  background:active?chipColor+"20":"transparent",color:active?chipColor:"var(--muted)",
-                  cursor:"pointer",transition:"all .15s",whiteSpace:"nowrap"}}>
-                {opt.label}
-              </button>
-            );
-          })}
-        </div>
-        {/* Search input */}
-        <div style={{position:"relative",flex:1,minWidth:180,maxWidth:360}}>
-          <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"var(--muted)",fontSize:13,pointerEvents:"none"}}>⌕</span>
-          <input
-            value={search}
-            onChange={e=>setSearch(e.target.value)}
-            placeholder={placeholders[searchField]}
-            style={{width:"100%",paddingLeft:30,paddingRight:search?28:10,boxSizing:"border-box"}}
-          />
-          {search&&(
-            <button onClick={()=>setSearch("")}
-              style={{position:"absolute",right:7,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"var(--muted)",cursor:"pointer",fontSize:14,lineHeight:1,padding:0}}>
-              ✕
-            </button>
-          )}
-        </div>
-        {/* Match count */}
-        {q&&(
-          <span style={{fontSize:11,color:"var(--muted)",whiteSpace:"nowrap",fontFamily:"monospace",flexShrink:0}}>
-            {filteredItems.length}/{items.length} items
-          </span>
-        )}
-      </div>
-      <div style={{overflowX:"auto"}}>
-      <datalist id="uopts">{UNIT_LIST.map(u=><option key={u} value={u}/>)}</datalist>
-      <table style={{tableLayout:"auto",width:"100%",minWidth:minW}}>
-        <colgroup>
-          <col style={{width:42}}/>
-          {hasLineItemId&&<col style={{width:110}}/>}
-          {hasLabel&&<col style={{width:100}}/>}
-          <col/>{/* description — flex */}
-          {hasUnit&&<col style={{width:80}}/>}
-          <col style={{width:100}}/>
-          {showEng&&<><col style={{width:95}}/><col style={{width:90}}/></>}
-          {showQS &&<><col style={{width:90}}/><col style={{width:90}}/></>}
-          {showSite&&<><col style={{width:95}}/><col style={{width:90}}/></>}
-          {canEditPlan&&<col style={{width:36}}/>}
-        </colgroup>
-        <thead>
-          <tr>
-            <th>#</th>
-            {hasLineItemId&&<th>Line Item ID</th>}
-            {hasLabel&&<th>Label</th>}
-            <th>Item Description</th>
-            {hasUnit&&<th style={{textAlign:"center"}}>Unit</th>}
-            <th style={{textAlign:"center",color:"var(--plan)"}}>BOQ Qty</th>
-            {showEng&&<th style={{textAlign:"center",color:"var(--eng)"}}>Eng. Qty</th>}
-            {showEng&&<th style={{textAlign:"center"}}>Eng↔Plan</th>}
-            {showQS &&<th style={{textAlign:"center",color:"var(--qs)"}}>QS Qty</th>}
-            {showQS &&<th style={{textAlign:"center"}}>QS↔Eng</th>}
-            {showSite&&<th style={{textAlign:"center",color:"var(--site)"}}>Site Qty</th>}
-            {showSite&&<th style={{textAlign:"center"}}>Site↔Eng</th>}
-            {canEditPlan&&<th/>}
-          </tr>
-        </thead>
-        <tbody>
-          {filteredItems.length===0&&<tr><td colSpan={14} style={{textAlign:"center",padding:"40px 0",color:"var(--muted)"}}>{q?`No items match "${search}"`:'No items'}</td></tr>}
-          {filteredItems.map((item,idx)=>{
-            const engDiff=(item.engQty||0)-(item.planQty||0);
-            const qsDiff =(item.qsQty||0) -(item.engQty||0);
-            const siteDiff=(item.siteQty||0)-(item.engQty||0);
-            const isLast=idx===filteredItems.length-1;
-            return(
-              <tr key={item.id} ref={isLast?lastRowRef:null} style={{verticalAlign:"top"}}>
-                <td style={{color:"var(--muted)",paddingTop:12,fontSize:12}}>{idx+1}</td>
-
-                {/* Line Item ID — only if any item has it */}
-                {hasLineItemId&&(
-                  <td style={{paddingTop:10}}>
-                    {canEditPlan
-                      ?<input value={item.lineItemId||""} onChange={e=>onUpdateItem(item.id,"lineItemId",e.target.value)} style={{fontSize:12}}/>
-                      :<span style={{fontSize:12,color:"var(--muted)"}}>{item.lineItemId||"—"}</span>}
-                  </td>
-                )}
-
-                {/* Label — only if any item has it */}
-                {hasLabel&&(
-                  <td style={{paddingTop:10}}>
-                    {canEditPlan
-                      ?<input value={item.label||""} onChange={e=>onUpdateItem(item.id,"label",e.target.value)} style={{fontSize:12}}/>
-                      :<span style={{fontSize:12,color:"var(--muted)"}}>{item.label||"—"}</span>}
-                  </td>
-                )}
-
-                {/* Description */}
-                <td style={{paddingTop:10,whiteSpace:"normal"}}>
-                  <DescCell text={item.name} editable={canEditPlan} onChange={v=>onUpdateItem(item.id,"name",v)}/>
-                </td>
-
-                {/* Unit — only if any item has unit data */}
-                {hasUnit&&(
-                  <td style={{textAlign:"center",paddingTop:10}}>
-                    {canEditPlan
-                      ?<input value={item.unit||""} onChange={e=>onUpdateItem(item.id,"unit",e.target.value)} list="uopts" style={{textAlign:"center"}}/>
-                      :<span>{item.unit||"—"}</span>}
-                  </td>
-                )}
-
-                {/* BOQ Qty — locked after submit */}
-                <td style={{textAlign:"center",paddingTop:10}}>
-                  {canEditPlan
-                    ?<input type="number" value={item.planQty||0} min={0} onChange={e=>onUpdateItem(item.id,"planQty",pn(e.target.value))} style={{textAlign:"center"}}/>
-                    :<span style={{fontWeight:600,color:"var(--plan)"}}>{item.planQty||0}</span>}
-                </td>
-
-                {/* Eng Qty */}
-                {showEng&&(
-                  <td style={{textAlign:"center",paddingTop:10}}>
-                    {editField==="engQty"
-                      ?<input type="number" value={item.engQty||0} min={0} onChange={e=>onUpdateItem(item.id,"engQty",pn(e.target.value))} style={{textAlign:"center",borderColor:"var(--eng)",background:"#0a2a1a"}}/>
-                      :<span style={{fontWeight:600,color:"var(--eng)"}}>{item.engQty||0}</span>}
-                  </td>
-                )}
-                {showEng&&<td style={{textAlign:"center",paddingTop:12}}><DiffBadge diff={engDiff} show={item.engQty>0}/></td>}
-
-                {/* QS Qty */}
-                {showQS&&(
-                  <td style={{textAlign:"center",paddingTop:10}}>
-                    {editField==="qsQty"
-                      ?<input type="number" value={item.qsQty||0} min={0} onChange={e=>onUpdateItem(item.id,"qsQty",pn(e.target.value))} style={{textAlign:"center",borderColor:"var(--qs)",background:"#2a1a00"}}/>
-                      :<span style={{fontWeight:600,color:"var(--qs)"}}>{item.qsQty||0}</span>}
-                  </td>
-                )}
-                {showQS&&<td style={{textAlign:"center",paddingTop:12}}><DiffBadge diff={qsDiff} show={item.qsQty>0}/></td>}
-
-                {/* Site Qty — compared against Engineering */}
-                {showSite&&(
-                  <td style={{textAlign:"center",paddingTop:10}}>
-                    {editField==="siteQty"
-                      ?<input type="number" value={item.siteQty||0} min={0} onChange={e=>onUpdateItem(item.id,"siteQty",pn(e.target.value))} style={{textAlign:"center",borderColor:"var(--site)",background:"#2a0010"}}/>
-                      :<span style={{fontWeight:600,color:"var(--site)"}}>{item.siteQty||0}</span>}
-                  </td>
-                )}
-                {showSite&&<td style={{textAlign:"center",paddingTop:12}}><DiffBadge diff={siteDiff} show={item.siteQty>0}/></td>}
-
-                {canEditPlan&&<td style={{paddingTop:12}}><button onClick={()=>onUpdateItem(item.id,"__delete__",null)} style={{background:"none",color:"var(--red)",fontSize:15,border:"none",cursor:"pointer"}}>🗑</button></td>}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-      </div>
-    </div>
-  );
-}
-
-// ─── Totals Summary Bar ───────────────────────────────────────────────────────
-function TotalBar({items, showEng, showQS, showSite}){
-  const pt=items.reduce((s,i)=>s+(i.planQty||0),0);
-  const et=items.reduce((s,i)=>s+(i.engQty||0),0);
-  const qt=items.reduce((s,i)=>s+(i.qsQty||0),0);
-  const st=items.reduce((s,i)=>s+(i.siteQty||0),0);
-  const ed=et-pt, qd=qt-et, sd=st-et;
-  const dc=d=>d===0?"var(--green)":d>0?"var(--amber)":"var(--red)";
-  return(
-    <div style={{display:"flex",gap:20,flexWrap:"wrap",alignItems:"center",paddingTop:14,marginTop:14,borderTop:"1px solid var(--border)"}}>
-      <Chip label="Planning Total" value={pt} color="var(--plan)"/>
-      {showEng&&<><Chip label="Engineering Total" value={et} color="var(--eng)"/><Chip label="Eng↔Plan" value={(ed>0?"+":"")+ed} color={dc(ed)}/></>}
-      {showQS&&<><Chip label="QS Total" value={qt} color="var(--qs)"/><Chip label="QS↔Eng" value={(qd>0?"+":"")+qd} color={dc(qd)}/></>}
-      {showSite&&<><Chip label="Site Total" value={st} color="var(--site)"/><Chip label="Site↔Eng" value={(sd>0?"+":"")+sd} color={dc(sd)}/></>}
-    </div>
-  );
-}
-function Chip({label,value,color}){
-  return <div style={{fontSize:13}}><span style={{color:"var(--muted)"}}>{label}: </span><strong style={{color}}>{typeof value==="number"?value.toLocaleString():value}</strong></div>;
-}
-
-// ─── Activity Log ─────────────────────────────────────────────────────────────
-function ActivityLog({log}){
-  return(
-    <Card style={{marginTop:16}}>
-      <h3 style={{fontFamily:"Sora",fontSize:16,marginBottom:16}}>📜 Activity Log</h3>
-      {!(log||[]).length&&<div style={{color:"var(--muted)",fontSize:13}}>No activity yet</div>}
-      {(log||[]).slice().reverse().map((e,i)=>(
-        <div key={i} style={{display:"flex",gap:12,marginBottom:10}}>
-          <div style={{width:8,height:8,borderRadius:"50%",background:"var(--accent)",marginTop:5,flexShrink:0}}/>
-          <div><div style={{fontSize:13}}>{e.action}</div><div style={{fontSize:11,color:"var(--muted)",marginTop:2}}>{e.user} · {new Date(e.time).toLocaleString()}</div></div>
-        </div>
-      ))}
-    </Card>
-  );
-}
-
-// ─── Sheet Tabs ───────────────────────────────────────────────────────────────
-// Shown inside BOQ detail views when the BOQ has multiple sheets.
-// If only one sheet (or no sheets), renders nothing — UI looks identical to before.
-function SheetTabs({sheets, activeSheet, setActiveSheet, roleColor}){
-  if(!sheets||sheets.length<=1) return null;
-  return(
-    <div style={{display:"flex",gap:2,borderBottom:"1px solid var(--border)",marginBottom:16,overflowX:"auto"}}>
-      {sheets.map(s=>{
-        const isAct=activeSheet===s.sheetName;
-        return(
-          <button key={s.sheetName} onClick={()=>setActiveSheet(s.sheetName)}
-            style={{padding:"8px 16px",border:"none",background:"transparent",
-              color:isAct?(roleColor||"var(--accent)"):"var(--muted)",
-              fontSize:12,fontWeight:isAct?700:500,cursor:"pointer",whiteSpace:"nowrap",
-              borderBottom:isAct?`2px solid ${roleColor||"var(--accent)"}`:  "2px solid transparent",
-              transition:"all .15s",flexShrink:0}}>
-            📋 {s.sheetName}
-            <span style={{marginLeft:6,fontSize:10,background:"var(--s2)",border:"1px solid var(--border)",
-              borderRadius:10,padding:"1px 7px",fontFamily:"monospace",color:"var(--muted)"}}>
-              {s.items.length}
-            </span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── Alert Banner ─────────────────────────────────────────────────────────────
-function AlertBanner({icon,title,desc,color,bg}){
-  return(
-    <div style={{marginBottom:14,padding:"12px 16px",background:"var(--s3)",border:`1px solid ${color}`,borderRadius:10,display:"flex",gap:12,alignItems:"flex-start"}}>
-      <span style={{fontSize:20,flexShrink:0}}>{icon}</span>
-      <div><div style={{fontWeight:600,color}}>{title}</div><div style={{fontSize:12,color:"var(--muted)",marginTop:2}}>{desc}</div></div>
-    </div>
-  );
-}
-
-// ─── Login ────────────────────────────────────────────────────────────────────
-function LoginScreen({onLogin,users,theme,toggleTheme}){
+function LoginScreen({onLogin,theme,toggleTheme}){
   const [email,setEmail]=useState("");
   const [pw,setPw]=useState("");
   const [err,setErr]=useState("");
   const [loading,setLoading]=useState(false);
-  const go=()=>{
+  
+  const go = async () => {
     if(loading)return;
+    if(!email||!pw){setErr("Please enter email and password");return;}
     setLoading(true);setErr("");
-    setTimeout(()=>{
-      const u=users.find(u=>u.email===email.trim().toLowerCase()&&u.password===pw&&u.active!==false);
-      if(u){setLoading(false);onLogin(u);}else{setErr("Invalid credentials or account disabled.");setLoading(false);}
-    },400);
+    
+    // 1. Authenticate with Supabase
+    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+      email: email.trim(),
+      password: pw
+    });
+    
+    if (authError) {
+      setErr(authError.message);
+      setLoading(false);
+      return;
+    }
+    
+    // 2. Fetch the custom Profile to get the Role
+    const { data: profile, error: profError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('id', authData.user.id)
+      .single();
+      
+    if(profError){
+      setErr("Failed to load user profile");
+      setLoading(false);
+      return;
+    }
+    
+    setLoading(false);
+    // 3. Log user into the frontend state
+    onLogin({
+      id: profile.id,
+      email: profile.email,
+      name: profile.name || profile.email.split('@')[0],
+      role: profile.role,
+      active: true
+    });
   };
+
   return(
     <div data-theme={theme} style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"var(--bg)",color:"var(--text)",position:"relative"}}>
       <div style={{position:"absolute", top:20, right:20}}>
@@ -702,40 +157,18 @@ function LoginScreen({onLogin,users,theme,toggleTheme}){
           {theme === "light" ? "🌙 Dark Mode" : "☀️ Light Mode"}
         </Btn>
       </div>
-      <div className="fade-in" style={{width:"100%",maxWidth:460,padding:20}}>
+      <div className="fade-in" style={{width:"100%",maxWidth:400,padding:20}}>
         <div style={{textAlign:"center",marginBottom:26}}>
           <div style={{width:64,height:64,borderRadius:18,background:"linear-gradient(135deg,#8b5cf6,#3b82f6)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:30,margin:"0 auto 14px",boxShadow:"0 0 30px #8b5cf640"}}>📋</div>
           <h1 style={{fontFamily:"Sora",fontSize:26,fontWeight:800}}>ELIZA</h1>
-          <p style={{color:"var(--muted)",fontSize:13,marginTop:5}}></p>
+          <p style={{color:"var(--muted)",fontSize:13,marginTop:5}}>Sign in to access your dashboard</p>
         </div>
         <Card style={{padding:28}}>
           <div style={{display:"flex",flexDirection:"column",gap:13}}>
             <div><label style={{fontSize:11,color:"var(--muted)",display:"block",marginBottom:5}}>EMAIL</label><input value={email} onChange={e=>setEmail(e.target.value)} type="email" placeholder="your@email.com"/></div>
             <div><label style={{fontSize:11,color:"var(--muted)",display:"block",marginBottom:5}}>PASSWORD</label><input value={pw} onChange={e=>setPw(e.target.value)} type="password" placeholder="••••••••" onKeyDown={e=>e.key==="Enter"&&go()}/></div>
-            {err&&<div style={{color:"var(--red)",fontSize:12,textAlign:"center"}}>{err}</div>}
-            <Btn onClick={go} disabled={loading} style={{width:"100%",padding:12,marginTop:2}}>{loading?"Signing in…":"Sign In →"}</Btn>
-          </div>
-          <div style={{marginTop:18,padding:14,background:"var(--s2)",borderRadius:10}}>
-            <div style={{fontSize:11,color:"var(--muted)",fontWeight:600,marginBottom:8}}></div>
-            {users.filter(u=>u.active!==false&&u.role!=="vendor").map(u=>(
-              <div key={u.id} onClick={()=>onLogin(u)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 10px",borderRadius:6,cursor:"pointer",marginBottom:3}}
-                onMouseEnter={e=>e.currentTarget.style.background="var(--s3)"}
-                onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                <span style={{color:ROLE_META[u.role]?.color,fontWeight:600}}>{ROLE_META[u.role]?.icon} {ROLE_META[u.role]?.label}</span>
-                <span style={{color:"var(--muted)",fontSize:12}}>{u.email} / {u.password}</span>
-              </div>
-            ))}
-            <div style={{borderTop:"1px solid var(--border)",margin:"8px 0",paddingTop:8}}>
-              <div style={{fontSize:10,color:"var(--s3)",fontWeight:600,marginBottom:6}}>🏭 VENDOR LOGINS (for quotation testing)</div>
-              {users.filter(u=>u.role==="vendor"&&u.active!==false).map(u=>(
-                <div key={u.id} onClick={()=>onLogin(u)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"7px 10px",borderRadius:6,cursor:"pointer",marginBottom:3}}
-                  onMouseEnter={e=>e.currentTarget.style.background="var(--s3)"}
-                  onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                  <span style={{color:"#06b6d4",fontWeight:600}}>🏭 {u.name}</span>
-                  <span style={{color:"var(--muted)",fontSize:12}}>{u.email} / {u.password}</span>
-                </div>
-              ))}
-            </div>
+            {err&&<div style={{color:"var(--red)",fontSize:13,textAlign:"center",padding:"8px",background:"var(--s3)",borderRadius:8,border:"1px solid var(--red)"}}>{err}</div>}
+            <Btn onClick={go} disabled={loading} style={{width:"100%",padding:12,marginTop:2}}>{loading?"Authenticating…":"Sign In →"}</Btn>
           </div>
         </Card>
       </div>
@@ -744,6 +177,7 @@ function LoginScreen({onLogin,users,theme,toggleTheme}){
 }
 
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
+
 function Sidebar({user,page,setPage,onLogout,boqs,theme,toggleTheme}){
   const role=ROLE_META[user.role]||{label:"User",color:"#94a3b8",icon:"👤",level:0};
   const engPending=boqs.filter(b=>b.status==="with_engineering").length;
@@ -751,12 +185,7 @@ function Sidebar({user,page,setPage,onLogout,boqs,theme,toggleTheme}){
   const sitePending=boqs.filter(b=>b.status==="with_site").length;
 
   const allNavMap={
-    planning:   [{id:"dashboard",icon:"🏠",label:"Dashboard"},{id:"create",icon:"➕",label:"New BOQ"},{id:"my-boqs",icon:"📋",label:"My BOQs"},{id:"search",icon:"🔍",label:"Search"},{id:"reports",icon:"📊",label:"Reports"}],
-    engineering:[{id:"dashboard",icon:"🏠",label:"Dashboard"},{id:"pending",icon:"📥",label:"Pending Review",badge:engPending},{id:"my-boqs",icon:"📋",label:"All BOQs"},{id:"search",icon:"🔍",label:"Search"},{id:"reports",icon:"📊",label:"Reports"}],
-    qs:         [{id:"dashboard",icon:"🏠",label:"Dashboard"},{id:"pending",icon:"📥",label:"Pending Review",badge:qsPending},{id:"my-boqs",icon:"📋",label:"All BOQs"},{id:"search",icon:"🔍",label:"Search"},{id:"reports",icon:"📊",label:"Reports"}],
-    site:       [{id:"dashboard",icon:"🏠",label:"Dashboard"},{id:"pending",icon:"📥",label:"Pending Review",badge:sitePending},{id:"my-boqs",icon:"📋",label:"All BOQs"},{id:"search",icon:"🔍",label:"Search"},{id:"reports",icon:"📊",label:"Reports"}],
     procurement:[{id:"dashboard",icon:"🏠",label:"Dashboard"},{id:"quotations",icon:"📝",label:"Quotations"}],
-    vendor:     [{id:"quotes",icon:"📋",label:"My Quotations"}],
   };
   const allNav=allNavMap[user.role]||[];
   const nav=allNav.filter(n=>!user.pages||user.pages.includes(n.id));
@@ -770,7 +199,7 @@ function Sidebar({user,page,setPage,onLogout,boqs,theme,toggleTheme}){
         </div>
       </div>
       <div style={{padding:"10px 14px",borderBottom:"1px solid var(--border)"}}>
-        <div style={{background:`var(--s2)`,border:`1px solid var(--border)`,borderRadius:8,padding:"8px 11px",display:"flex",alignItems:"center",gap:8}}>
+        <div style={{background:`var(--s2)`,border:`1px solid var(--border)`,borderRadius:8,padding:"8px 11px",display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:16}}>{role.icon}</span>
           <div><div style={{fontSize:11,fontWeight:600,color:role.color}}>{role.label}</div></div>
         </div>
@@ -799,803 +228,7 @@ function Sidebar({user,page,setPage,onLogout,boqs,theme,toggleTheme}){
 }
 
 // ─── Generic Dashboard ────────────────────────────────────────────────────────
-function Dashboard({user,boqs,setPage,notifications,pendingStatus,pendingLabel}){
-  const role=ROLE_META[user.role];
-  const pending=boqs.filter(b=>b.status===pendingStatus).length;
-  const done=boqs.filter(b=>b.status==="completed").length;
-  const received=boqs.filter(b=>b.status!=="draft").length;
-  const unread=notifications.filter(n=>!n.read);
 
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:22}}><h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700}}>{role.icon} {role.label} Dashboard</h1><p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>{pendingLabel}</p></div>
-
-      {unread.length>0&&(
-        <div style={{marginBottom:18,padding:"13px 16px",background:"#1e1a00",border:"1px solid var(--amber)",borderRadius:12,display:"flex",alignItems:"center",gap:12}}>
-          <span style={{fontSize:22}}>🔔</span>
-          <div style={{flex:1}}><div style={{fontWeight:600,color:"var(--amber)"}}>{unread.length} unread notification{unread.length>1?"s":""}</div><div style={{fontSize:12,color:"var(--muted)",marginTop:2,lineHeight:1.5}}>{unread[unread.length-1]?.message}</div></div>
-        </div>
-      )}
-
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16,marginBottom:24}}>
-        <StatCard icon="📋" label="Total Received" value={user.role==="planning"?boqs.filter(b=>b.createdBy===user.id).length:boqs.length} color={role.color}/>
-        <StatCard icon="⏳" label="Pending Review" value={pending} color="var(--accent)"/>
-        <StatCard icon="✅" label="Completed" value={done} color="var(--green)"/>
-      </div>
-
-      {pending>0&&(
-        <Card style={{borderColor:`${role.color}40`}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div><h3 style={{fontFamily:"Sora",fontSize:16}}>⚡ Action Required</h3><p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>{pending} BOQ{pending>1?"s":""} awaiting your review</p></div>
-            <Btn variant={user.role==="site"?"rose":user.role==="qs"?"amber":"success"} onClick={()=>setPage("pending")}>Review Now →</Btn>
-          </div>
-        </Card>
-      )}
-    </div>
-  );
-}
-
-// ─── Planning: Dashboard ──────────────────────────────────────────────────────
-function PlanningDash({boqs,user,setPage,notifications}){
-  const mine=boqs.filter(b=>b.createdBy===user.id);
-  const unread=notifications.filter(n=>!n.read);
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:22}}><h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700}}>📐 Planning Dashboard</h1><p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>Create and manage Bills of Quantities</p></div>
-      {unread.length>0&&(
-        <div style={{marginBottom:18,padding:"13px 16px",background:"#1e1a00",border:"1px solid var(--amber)",borderRadius:12,display:"flex",alignItems:"center",gap:12}}>
-          <span style={{fontSize:22}}>🔔</span>
-          <div style={{flex:1}}><div style={{fontWeight:600,color:"var(--amber)"}}>{unread.length} unread notification{unread.length>1?"s":""}</div><div style={{fontSize:12,color:"var(--muted)",marginTop:2,lineHeight:1.5}}>{unread[unread.length-1]?.message}</div></div>
-          <Btn small variant="amber" onClick={()=>setPage("my-boqs")}>View BOQs →</Btn>
-        </div>
-      )}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16,marginBottom:24}}>
-        <StatCard icon="📋" label="Total BOQs" value={mine.length} color="var(--plan)"/>
-        <StatCard icon="📝" label="Drafts" value={mine.filter(b=>b.status==="draft").length} color="var(--muted)"/>
-        <StatCard icon="✅" label="Completed" value={mine.filter(b=>b.status==="completed").length} color="var(--green)"/>
-      </div>
-      <Card>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-          <h3 style={{fontFamily:"Sora",fontSize:16}}>Recent BOQs</h3>
-          <Btn variant="purple" small onClick={()=>setPage("create")}>+ New BOQ</Btn>
-        </div>
-        {mine.length===0?<div style={{textAlign:"center",padding:"36px 0",color:"var(--muted)"}}><div style={{fontSize:40,marginBottom:10}}>📋</div>No BOQs yet.</div>
-          :<table><thead><tr><th>BOQ ID</th><th>Date</th><th>Items</th><th>Status</th></tr></thead>
-            <tbody>{mine.slice().reverse().map(b=>(
-              <tr key={b.id}><td style={{fontFamily:"monospace",fontSize:12}}>{b.boqId}</td><td style={{color:"var(--muted)"}}>{new Date(b.createdAt).toLocaleDateString()}</td><td>{b.items.length}</td><td><Badge status={b.status}/></td></tr>
-            ))}</tbody></table>}
-      </Card>
-    </div>
-  );
-}
-
-// ─── BOQ Creator ──────────────────────────────────────────────────────────────
-
-// ─── Export BOQ to Excel per stage ────────────────────────────────────────────
-function exportBoqExcel(boq, stage){
-  // stage: "planning" | "engineering" | "qs" | "site" | "full"
-  const stageMap={
-    planning: {label:"BOQ Qty",   cols:["planQty"],                    filename:"PLANNING"},
-    engineering:{label:"Eng Qty", cols:["planQty","engQty"],           filename:"ENGINEERING"},
-    qs:        {label:"QS Qty",   cols:["planQty","engQty","qsQty"],   filename:"QS"},
-    site:      {label:"Site Qty", cols:["planQty","engQty","qsQty","siteQty"], filename:"SITE"},
-    full:      {label:"All",      cols:["planQty","engQty","qsQty","siteQty"], filename:"FULL"},
-  };
-  const s=stageMap[stage]||stageMap.full;
-  const colHeaders=["#","Line Item ID","Label","Description","Unit"];
-  const colKeys=["#","lineItemId","label","name","unit"];
-  const qtyLabels={"planQty":"BOQ Qty","engQty":"Eng Qty","qsQty":"QS Qty","siteQty":"Site Qty"};
-  s.cols.forEach(k=>{ colHeaders.push(qtyLabels[k]); colKeys.push(k); });
-  // Add diff columns for stages beyond first
-  if(s.cols.includes("engQty")){ colHeaders.push("Eng↔BOQ"); colKeys.push("_engDiff"); }
-  if(s.cols.includes("qsQty")){  colHeaders.push("QS↔Eng");  colKeys.push("_qsDiff");  }
-  if(s.cols.includes("siteQty")){colHeaders.push("Site↔Eng");colKeys.push("_siteDiff");}
-
-  const rows=[colHeaders];
-  boq.items.forEach((it,idx)=>{
-    const row=[];
-    colKeys.forEach(k=>{
-      if(k==="#")            row.push(idx+1);
-      else if(k==="_engDiff") row.push((it.engQty||0)-(it.planQty||0));
-      else if(k==="_qsDiff")  row.push((it.qsQty||0)-(it.engQty||0));
-      else if(k==="_siteDiff")row.push((it.siteQty||0)-(it.engQty||0));
-      else row.push(it[k]??0);
-    });
-    rows.push(row);
-  });
-  // Totals row
-  const totRow=["","","","Totals",""];
-  s.cols.forEach(k=>totRow.push(boq.items.reduce((s,i)=>s+(i[k]||0),0)));
-  if(s.cols.includes("engQty")) totRow.push("");
-  if(s.cols.includes("qsQty"))  totRow.push("");
-  if(s.cols.includes("siteQty"))totRow.push("");
-  rows.push([]);rows.push(totRow);
-
-  const csv=rows.map(r=>r.map(c=>`"${String(c??'').replace(/"/g,'""')}"`).join(",")).join("\n");
-  const a=document.createElement("a");
-  a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-  a.download=`${boq.boqId}-${s.filename}.csv`;
-  a.click();
-}
-
-// ─── Time-with-team indicator ─────────────────────────────────────────────────
-function TimeWithTeam({boq}){
-  const statusToTeam={
-    with_engineering:"Engineering Team",
-    with_qs:"Quantity Survey Team",
-    with_site:"Project Team",
-  };
-  const teamName=statusToTeam[boq.status];
-  if(!teamName) return null;
-  // Find the log entry that moved it to the current status
-  const log=boq.activityLog||[];
-  // The transition event is the latest log entry
-  const lastEntry=log[log.length-1];
-  if(!lastEntry) return null;
-  const since=lastEntry.time;
-  const elapsed=Date.now()-since;
-  const mins=Math.floor(elapsed/60000);
-  const hrs=Math.floor(elapsed/3600000);
-  const days=Math.floor(elapsed/86400000);
-  let timeStr, urgency="normal";
-  if(mins<60)       timeStr=`${mins}m`;
-  else if(hrs<24)   timeStr=`${hrs}h ${mins%60}m`;
-  else              timeStr=`${days}d ${hrs%24}h`;
-  if(days>=7)       urgency="critical";
-  else if(days>=3)  urgency="warning";
-  const colors={normal:"var(--green)",warning:"var(--amber)",critical:"var(--red)"};
-  const c=colors[urgency];
-  return(
-    <div style={{display:"inline-flex",alignItems:"center",gap:6,background:"var(--s3)",border:`1px solid var(--border)`,
-      borderRadius:8,padding:"5px 12px",fontSize:12,fontWeight:600,color:c}}>
-      <span style={{fontSize:14}}>⏱</span>
-      <span>With {teamName} for <strong>{timeStr}</strong></span>
-    </div>
-  );
-}
-
-function BOQCreator({onSave,user}){
-  // Single active sheet's items (for the old single-sheet path)
-  const [items,setItems]=useState([]);
-  const [ps,setPs]=useState(null);
-  const [pm,setPm]=useState("");
-  const [drag,setDrag]=useState(false);
-  const [done,setDone]=useState(false);
-  const [srcFile,setSrcFile]=useState(null);
-  const fref=useRef(null);
-  const lastRowRef=useRef(null);
-  // ── Multi-sheet state ──────────────────────────────────────────────────────
-  const [allSheets,setAllSheets]=useState([]); // [{sheetName, items}]
-  const [selSheets,setSelSheets]=useState(new Set()); // selected sheet names
-  const [activeSheet,setActiveSheet]=useState(null); // currently viewed sheet name
-  const isMulti=allSheets.length>1;
-
-  const addRow=()=>{
-    setItems(p=>[...p,{id:Date.now(),lineItemId:"",label:"",name:"",unit:"",planQty:0,engQty:0,qsQty:0,siteQty:0}]);
-    // Scroll to the new row after React re-renders
-    setTimeout(()=>lastRowRef.current?.scrollIntoView({behavior:"smooth",block:"center"}),50);
-  };
-
-  const upd=(id,f,v)=>{
-    if(f==="__delete__"){setItems(p=>p.filter(i=>i.id!==id));return;}
-    setItems(p=>p.map(i=>i.id===id?{...i,[f]:v}:i));
-  };
-
-  const processFile=file=>{
-    if(!file)return;
-    const n=file.name.toLowerCase();
-    if(!n.endsWith(".xlsx")&&!n.endsWith(".xls")&&!n.endsWith(".csv")){setPs("error");setPm("Only .xlsx, .xls or .csv supported.");return;}
-    setPs("parsing");setPm(`Reading "${file.name}"…`);
-    const reader=new FileReader();
-    reader.onload=e=>{
-      try{
-        const arrayBuf=e.target.result;
-        const wb=XLSX.read(new Uint8Array(arrayBuf),{type:"array",cellText:true,cellDates:true});
-        const sheets=parseAllSheets(wb);
-        const validSheets=sheets.filter(s=>s.items.length>0);
-        if(validSheets.length===0){
-          const rs=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:"",raw:false});
-          const prev=rs.slice(0,4).map(r=>r.filter(c=>String(c).trim()).slice(0,5).join("|")).filter(Boolean).join(" → ");
-          setPs("error");setPm(`No items found in any sheet. Preview: [${prev||"empty"}]`);return;
-        }
-        const bytes=new Uint8Array(arrayBuf);
-        let binary="";
-        for(let i=0;i<bytes.byteLength;i++)binary+=String.fromCharCode(bytes[i]);
-        const b64=btoa(binary);
-        const mime=n.endsWith(".csv")?"text/csv":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-        setSrcFile({name:file.name,size:file.size,dataUrl:`data:${mime};base64,${b64}`,type:mime});
-
-        if(validSheets.length===1){
-          // Single-sheet path — same as before
-          const parsed=validSheets[0].items;
-          const detected=[];
-          if(parsed.some(i=>i.lineItemId)) detected.push("Line Item ID");
-          if(parsed.some(i=>i.label))      detected.push("Label");
-          detected.push("Description");
-          if(parsed.some(i=>i.unit))       detected.push("Unit");
-          if(parsed.some(i=>i.planQty>0))  detected.push("Qty");
-          const missing=["Line Item ID","Label","Unit"].filter(f=>!detected.includes(f));
-          const note=missing.length?` (missing: ${missing.join(", ")} — columns hidden)`:"";
-          setItems(parsed);
-          setAllSheets([]);setSelSheets(new Set());setActiveSheet(null);
-          setPs("done");setPm(`✅ Extracted ${parsed.length} items from "${validSheets[0].sheetName}" · Detected: ${detected.join(", ")}${note}`);
-        } else {
-          // Multi-sheet path — let user select sheets
-          setAllSheets(validSheets);
-          const allNames=new Set(validSheets.map(s=>s.sheetName));
-          setSelSheets(allNames); // default: all selected
-          setActiveSheet(validSheets[0].sheetName);
-          setItems([]); // items come from sheet selection
-          setPs("sheets");
-          setPm(`📋 Found ${validSheets.length} sheets with data — select which to include below`);
-        }
-      }catch(err){setPs("error");setPm(`Error: ${err.message}`);}
-    };
-    reader.onerror=()=>{setPs("error");setPm("Could not read file.");};
-    reader.readAsArrayBuffer(file);
-  };
-
-  // Active sheet's items for preview
-  const activeSheetItems=activeSheet
-    ?allSheets.find(s=>s.sheetName===activeSheet)?.items||[]
-    :items;
-
-  // All selected sheets' items merged (for submit)
-  const mergedItems=isMulti
-    ?allSheets.filter(s=>selSheets.has(s.sheetName)).flatMap(s=>s.items)
-    :items;
-
-  const toggleSheet=name=>{
-    setSelSheets(p=>{
-      const n=new Set(p);
-      if(n.has(name)) n.delete(name); else n.add(name);
-      return n;
-    });
-  };
-
-  const submit=asDraft=>{
-    const defaultAtts=srcFile?[{id:Date.now(),name:srcFile.name,size:srcFile.size,type:srcFile.type,dataUrl:srcFile.dataUrl,uploadedBy:user.name,uploadedAt:Date.now(),note:"Source BOQ sheet (auto-attached)"}]:[];
-    let finalSheets, flatItems;
-    if(isMulti){
-      // Keep each sheet separate; also build flat items for compat (counts, reports)
-      finalSheets=allSheets
-        .filter(s=>selSheets.has(s.sheetName))
-        .map(s=>({sheetName:s.sheetName,items:s.items.filter(i=>i.name)}));
-      flatItems=finalSheets.flatMap(s=>s.items);
-    } else {
-      finalSheets=null; // no sheet structure for manual/single-sheet
-      flatItems=items.filter(i=>i.name);
-    }
-    const boq={
-      id:Date.now(),boqId:genId(),createdBy:user.id,createdAt:Date.now(),
-      status:asDraft?"draft":"with_engineering",
-      sheets:finalSheets,       // null for single-sheet; array for multi-sheet
-      items:flatItems,           // always flat — used for counts, reports, compat
-      attachments:defaultAtts,
-      activityLog:[{time:Date.now(),user:user.name,action:asDraft?"Saved as Draft":"Submitted to Engineering Team"}],
-    };
-    onSave(boq);setDone(true);
-  };
-
-  if(done) return(<div className="fade-in" style={{textAlign:"center",padding:"80px 0"}}><div style={{fontSize:60,marginBottom:14}}>✅</div><h2 style={{fontFamily:"Sora",fontSize:22,marginBottom:8}}>Submitted to Engineering!</h2><p style={{color:"var(--muted)"}}>Engineering → QS → Project Team will review in sequence.</p></div>);
-
-  const ub=drag?"var(--s3)":"var(--s2)";
-  const uc=drag?"var(--green)":ps==="error"?"var(--red)":"var(--accent)";
-
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:20}}><h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700}}>Create New BOQ</h1><p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>Upload Excel/CSV or add items manually</p></div>
-      <div onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);processFile(e.dataTransfer.files[0]);}} onClick={()=>fref.current?.click()}
-        style={{border:`2px dashed ${uc}`,borderRadius:14,background:ub,padding:"20px",textAlign:"center",cursor:"pointer",marginBottom:12,transition:"all .2s"}}>
-        <input ref={fref} type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={e=>processFile(e.target.files[0])}/>
-        {ps==="parsing"?<><div style={{fontSize:28,marginBottom:6}}>⏳</div><div style={{fontWeight:600}}>Parsing…</div></>
-          :<><div style={{fontSize:32,marginBottom:6}}>{drag?"📂":"⬆️"}</div>
-            <div style={{fontWeight:600,marginBottom:4}}>{drag?"Drop to upload":"Drag & drop Excel / CSV"}</div>
-            <div style={{color:"var(--muted)",fontSize:12,marginBottom:10}}>Auto-detects: Line Item ID · Label · Description · Unit · Qty</div>
-            <div style={{display:"inline-block",background:"var(--accent)",color:"#fff",padding:"6px 18px",borderRadius:8,fontSize:13,fontWeight:600}}>Browse Files</div></>}
-      </div>
-      {pm&&<div style={{marginBottom:12,padding:"8px 14px",borderRadius:9,fontSize:13,background:"var(--s3)",color:ps==="done"?"var(--green)":ps==="error"?"var(--red)":"var(--muted)",border:`1px solid var(--border)`}}>{pm}</div>}
-      {/* ── Multi-sheet selector ── */}
-      {isMulti&&(
-        <Card style={{marginBottom:16}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-            <h3 style={{fontFamily:"Sora",fontSize:16}}>📑 Sheets Found</h3>
-            <div style={{display:"flex",gap:6}}>
-              <Btn variant="ghost" small onClick={()=>setSelSheets(new Set(allSheets.map(s=>s.sheetName)))}>Select All</Btn>
-              <Btn variant="ghost" small onClick={()=>setSelSheets(new Set())}>Deselect All</Btn>
-            </div>
-          </div>
-          <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:16}}>
-            {allSheets.map(s=>{
-              const sel=selSheets.has(s.sheetName);
-              const active=activeSheet===s.sheetName;
-              return(
-                <div key={s.sheetName} style={{border:`1px solid ${active?"var(--accent)":sel?"var(--green)":"var(--border)"}`,borderRadius:10,padding:"8px 14px",background:active?"var(--s3)":sel?"var(--s2)":"var(--surface)",cursor:"pointer",transition:"all .15s",minWidth:160}}
-                  onClick={()=>setActiveSheet(s.sheetName)}>
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:4}}>
-                    <span style={{fontWeight:700,fontSize:13,color:active?"var(--accent)":sel?"var(--green)":"var(--text)",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",maxWidth:160}}>{s.sheetName}</span>
-                    <button onClick={e=>{e.stopPropagation();toggleSheet(s.sheetName);}}
-                      style={{flexShrink:0,width:20,height:20,borderRadius:4,border:`1px solid ${sel?"var(--green)":"var(--border)"}`,background:sel?"var(--green)":"transparent",color:sel?"#fff":"var(--muted)",cursor:"pointer",fontSize:12,lineHeight:"18px",textAlign:"center",padding:0}}>
-                      {sel?"✓":""}
-                    </button>
-                  </div>
-                  <div style={{fontSize:11,color:"var(--muted)"}}>{s.items.length} items</div>
-                </div>
-              );
-            })}
-          </div>
-          <div style={{fontSize:12,color:"var(--muted)",padding:"6px 12px",background:"var(--s3)",borderRadius:8,border:"1px solid var(--border)"}}>
-            📌 Click a sheet card to preview its items below · Use the checkbox to include/exclude from submission · <strong style={{color:"var(--text)"}}>{selSheets.size} of {allSheets.length} sheets selected</strong>
-          </div>
-        </Card>
-      )}
-
-      <Card>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-          <h3 style={{fontFamily:"Sora",fontSize:16}}>
-            📦 {isMulti?`Sheet: "${activeSheet||""}"`:"BOQ Items"}
-          </h3>
-          <div style={{display:"flex",gap:8}}>
-            {!isMulti&&items.length>0&&<Btn variant="ghost" small onClick={()=>{setItems([]);setAllSheets([]);setPs(null);setPm("");}}>Clear</Btn>}
-            {!isMulti&&<Btn variant="outline" small onClick={addRow}>+ Add Row</Btn>}
-          </div>
-        </div>
-        <ItemsTable items={isMulti?activeSheetItems:items} role="planning" editField={isMulti?null:"planQty"} onUpdateItem={isMulti?()=>{}:upd} stagesVisible={{eng:false,qs:false,site:false}} lastRowRef={lastRowRef}/>
-        {isMulti&&(
-          <div style={{marginTop:10,padding:"6px 12px",background:"var(--s3)",borderRadius:8,fontSize:12,color:"var(--muted)",border:"1px solid var(--border)"}}>
-            👁 Preview only — all selected sheets will be kept as separate tabs inside one BOQ
-          </div>
-        )}
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:16,paddingTop:14,borderTop:"1px solid var(--border)"}}>
-          <div style={{color:"var(--muted)",fontSize:13}}>Items: <strong style={{color:"var(--text)"}}>{(isMulti?mergedItems:items).filter(i=>i.name).length}</strong> · Total Qty: <strong style={{color:"var(--text)"}}>{(isMulti?mergedItems:items).reduce((s,i)=>s+(i.planQty||0),0).toLocaleString()}</strong>{isMulti&&selSheets.size>1&&<> · <strong style={{color:"var(--accent)"}}>{selSheets.size} sheets</strong> → 1 BOQ</>}</div>
-          <div style={{display:"flex",gap:10}}>
-            <Btn variant="ghost" onClick={()=>submit(true)}>Save Draft</Btn>
-            <Btn variant="success" onClick={()=>submit(false)} disabled={(isMulti?mergedItems:items).filter(i=>i.name).length===0}>Submit to Engineering →</Btn>
-          </div>
-        </div>
-      </Card>
-    </div>
-  );
-}
-
-// ─── BOQ List ─────────────────────────────────────────────────────────────────
-function BOQList({boqs,user,onSelect,filterStatus,users=[]}){
-  const [search,setSearch]=useState("");
-  let list=filterStatus?boqs.filter(b=>b.status===filterStatus):boqs;
-  if(user.role==="planning") list=list.filter(b=>b.createdBy===user.id);
-  if(search) list=list.filter(b=>b.boqId.toLowerCase().includes(search.toLowerCase()));
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:20}}><h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700}}>{filterStatus?"Pending Review":"All BOQs"}</h1><p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>{list.length} BOQ{list.length!==1?"s":""}</p></div>
-      <Card>
-        <div style={{marginBottom:14}}><input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Search BOQ ID…" style={{width:260}}/></div>
-        {list.length===0?<div style={{textAlign:"center",padding:"36px 0",color:"var(--muted)"}}><div style={{fontSize:36,marginBottom:10}}>📭</div>No BOQs found</div>
-          :<table><thead><tr><th>BOQ ID</th><th>Created By</th><th>Date</th><th>Items</th><th>Status</th><th>Time with Team</th><th/></tr></thead>
-            <tbody>{list.slice().reverse().map(b=>{
-              const c=users.find(u=>u.id===b.createdBy);
-              return(<tr key={b.id}><td style={{fontFamily:"monospace",fontSize:12}}>{b.boqId}</td><td>{c?.name||"—"}</td><td style={{color:"var(--muted)"}}>{new Date(b.createdAt).toLocaleDateString()}</td><td>{b.items.length}</td><td><Badge status={b.status}/></td><td><TimeWithTeam boq={b}/></td><td><Btn small variant="outline" onClick={()=>onSelect(b)}>View →</Btn></td></tr>);
-            })}</tbody></table>}
-      </Card>
-    </div>
-  );
-}
-
-
-// ─── Attachments Panel ────────────────────────────────────────────────────────
-function AttachmentsPanel({attachments=[], onAdd, canAdd=false}){
-  const fileRef = useRef(null);
-  const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
-
-  const ICONS = {
-    pdf:"📄", doc:"📝", docx:"📝", xls:"📊", xlsx:"📊", csv:"📊",
-    png:"🖼️", jpg:"🖼️", jpeg:"🖼️", gif:"🖼️", webp:"🖼️",
-    zip:"🗜️", rar:"🗜️", txt:"📃", ppt:"📊", pptx:"📊",
-  };
-  const iconFor = name => {
-    const ext = (name||"").split(".").pop().toLowerCase();
-    return ICONS[ext] || "📎";
-  };
-  const fmtSize = b => b < 1024 ? `${b}B` : b < 1024*1024 ? `${(b/1024).toFixed(1)}KB` : `${(b/(1024*1024)).toFixed(1)}MB`;
-
-  const readFile = file => {
-    setUploading(true);
-    const reader = new FileReader();
-    reader.onload = e => {
-      onAdd({
-        id: Date.now() + Math.random(),
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        dataUrl: e.target.result,
-        uploadedAt: Date.now(),
-      });
-      setUploading(false);
-    };
-    reader.onerror = () => setUploading(false);
-    reader.readAsDataURL(file);
-  };
-
-  const handleDrop = e => {
-    e.preventDefault(); setDragging(false);
-    Array.from(e.dataTransfer.files).forEach(readFile);
-  };
-
-  const download = att => {
-    const a = document.createElement("a");
-    a.href = att.dataUrl;
-    a.download = att.name;
-    a.click();
-  };
-
-  return(
-    <div style={{marginBottom:16}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
-        <h3 style={{fontFamily:"Sora",fontSize:14,fontWeight:700,color:"var(--text)",display:"flex",alignItems:"center",gap:7}}>
-          📎 Attachments
-          <span style={{fontSize:11,background:"var(--s3)",color:"var(--muted)",border:"1px solid var(--border)",borderRadius:20,padding:"1px 9px",fontWeight:600}}>{attachments.length}</span>
-        </h3>
-        {canAdd&&(
-          <Btn small variant="outline" onClick={()=>fileRef.current?.click()} disabled={uploading}>
-            {uploading?"Uploading…":"+ Attach File"}
-          </Btn>
-        )}
-        <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={e=>Array.from(e.target.files).forEach(readFile)}/>
-      </div>
-
-      {/* Drop zone — shown only when user can add */}
-      {canAdd&&(
-        <div
-          onDragOver={e=>{e.preventDefault();setDragging(true);}}
-          onDragLeave={()=>setDragging(false)}
-          onDrop={handleDrop}
-          style={{
-            border:`2px dashed ${dragging?"var(--accent)":"var(--border)"}`,
-            borderRadius:10, padding:"12px 16px",
-            background:dragging?"#1e3a5f20":"var(--s2)",
-            textAlign:"center", fontSize:12, color:"var(--muted)",
-            marginBottom:attachments.length?10:0,
-            transition:"all .2s", cursor:"pointer",
-          }}
-          onClick={()=>fileRef.current?.click()}
-        >
-          {dragging?"Drop files here":"Drag & drop files here, or click to browse — any file type accepted"}
-        </div>
-      )}
-
-      {/* File list */}
-      {attachments.length > 0 && (
-        <div style={{display:"flex",flexDirection:"column",gap:6}}>
-          {attachments.map(att=>(
-            <div key={att.id} style={{display:"flex",alignItems:"center",gap:10,background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"8px 12px"}}>
-              <span style={{fontSize:20,flexShrink:0}}>{iconFor(att.name)}</span>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:"flex",alignItems:"center",gap:6}}>
-                  <span style={{fontSize:13,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{att.name}</span>
-                  {att.note&&<span style={{fontSize:10,color:"#10b981",background:"#10b98118",border:"1px solid #10b98130",borderRadius:4,padding:"1px 6px",whiteSpace:"nowrap",flexShrink:0}}>auto</span>}
-                </div>
-                <div style={{fontSize:11,color:"var(--muted)",marginTop:1}}>
-                  {fmtSize(att.size)} · {att.uploadedBy?att.uploadedBy+" · ":""}{new Date(att.uploadedAt).toLocaleString()}
-                </div>
-              </div>
-              <button
-                onClick={()=>download(att)}
-                style={{padding:"5px 12px",fontSize:11,fontWeight:600,borderRadius:7,border:"1px solid var(--accent)",background:"transparent",color:"var(--accent)",cursor:"pointer",flexShrink:0,whiteSpace:"nowrap"}}
-              >⬇ Download</button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {attachments.length===0&&!canAdd&&(
-        <div style={{textAlign:"center",padding:"16px 0",color:"var(--muted)",fontSize:12,background:"var(--s2)",borderRadius:8,border:"1px solid var(--border)"}}>No attachments</div>
-      )}
-    </div>
-  );
-}
-
-// ─── Planning: View BOQ (all stages, all read-only) ───────────────────────────
-function PlanningView({boq,onBack,onUpdateBoq}){
-  const sheets=boq.sheets||null; // null = legacy flat items
-  const [activeSheet,setActiveSheet]=useState(sheets?sheets[0].sheetName:null);
-
-  // Items currently shown in the table
-  const visibleItems=sheets
-    ? (sheets.find(s=>s.sheetName===activeSheet)?.items||[])
-    : boq.items;
-
-  const allItems=boq.items; // always flat — used for stage detection & totals bar
-  const hasEng=allItems.some(i=>i.engQty>0);
-  const hasQS=allItems.some(i=>i.qsQty>0);
-  const hasSite=allItems.some(i=>i.siteQty>0);
-
-  const addAttachment = att => {
-    const updated = {...boq, attachments:[...(boq.attachments||[]),att]};
-    onUpdateBoq && onUpdateBoq(updated, null);
-  };
-
-  return(
-    <div className="fade-in">
-      {/* ── Top action bar ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,padding:"14px 18px",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,flexWrap:"wrap",gap:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <Btn variant="ghost" small onClick={onBack}>← Back</Btn>
-          <div style={{display:"flex",alignItems:"center",gap:12}}>
-            <h1 style={{fontFamily:"Sora",fontSize:20,fontWeight:700,margin:0}}>{boq.boqId}</h1>
-            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <Badge status={boq.status}/>
-              <span style={{color:"var(--muted)",fontSize:12}}>{new Date(boq.createdAt).toLocaleDateString()}</span>
-              {sheets&&sheets.length>1&&<span style={{fontSize:11,color:"var(--plan)",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:20,padding:"2px 8px"}}>{sheets.length} sheets</span>}
-            </div>
-          </div>
-        </div>
-        <span style={{fontSize:12,color:"var(--muted)",background:"var(--s2)",padding:"6px 14px",borderRadius:8,border:"1px solid var(--border)"}}>👁 Read-Only — Planning View</span>
-      </div>
-
-      {hasEng&&<AlertBanner icon="⚙️" title="Engineering Team has reviewed this BOQ" desc="Engineering quantities shown below. Your planning quantities are permanently locked." color="var(--eng)" bg="#0a2a1a"/>}
-      {hasQS&&<AlertBanner icon="📏" title="Quantity Survey Team has reviewed this BOQ" desc="QS quantities and comparisons shown below." color="var(--qs)" bg="#2a1a00"/>}
-      {hasSite&&<AlertBanner icon="🏗️" title="Project Team has reviewed this BOQ" desc="Project Team quantities are compared against Engineering quantities below." color="var(--site)" bg="#2a0010"/>}
-
-      <Card style={{marginBottom:16}}>
-        <AttachmentsPanel attachments={boq.attachments||[]} onAdd={addAttachment} canAdd={true}/>
-      </Card>
-
-      <Card style={{marginBottom:16}}>
-        <h3 style={{fontFamily:"Sora",fontSize:16,marginBottom:sheets&&sheets.length>1?12:16}}>📦 BOQ Items (Read Only)</h3>
-        <SheetTabs sheets={sheets} activeSheet={activeSheet} setActiveSheet={setActiveSheet} roleColor="var(--plan)"/>
-        <ItemsTable items={visibleItems} role="planning" editField={null} onUpdateItem={()=>{}} stagesVisible={{eng:hasEng,qs:hasQS,site:hasSite}}/>
-        <TotalBar items={visibleItems} showEng={hasEng} showQS={hasQS} showSite={hasSite}/>
-      </Card>
-      <ActivityLog log={boq.activityLog}/>
-    </div>
-  );
-}
-
-// ─── Engineering: BOQ Detail ──────────────────────────────────────────────────
-function EngineeringView({boq,onUpdate,onBack}){
-  const initSheets=boq.sheets
-    ? boq.sheets.map(s=>({...s,items:s.items.map(i=>({...i,engQty:i.engQty||0}))}))
-    : null;
-  const [sheets,setSheets]=useState(initSheets);
-  const [activeSheet,setActiveSheet]=useState(initSheets?initSheets[0].sheetName:null);
-  // Legacy flat items (when no sheets)
-  const [items,setItems]=useState(sheets?[]:boq.items.map(i=>({...i,engQty:i.engQty||0})));
-  const [atts,setAtts]=useState(boq.attachments||[]);
-  const locked=boq.status!=="with_engineering";
-
-  const visibleItems=sheets
-    ? (sheets.find(s=>s.sheetName===activeSheet)?.items||[])
-    : items;
-
-  const upd=(id,f,v)=>{
-    if(f!=="engQty") return;
-    if(sheets){
-      setSheets(p=>p.map(s=>s.sheetName===activeSheet
-        ? {...s,items:s.items.map(i=>i.id===id?{...i,engQty:v}:i)}
-        : s));
-    } else {
-      setItems(p=>p.map(i=>i.id===id?{...i,engQty:v}:i));
-    }
-  };
-
-  const flatItems=sheets?sheets.flatMap(s=>s.items):items;
-
-  const submit=()=>onUpdate({
-    ...boq,
-    sheets:sheets||boq.sheets,
-    items:flatItems,
-    attachments:atts,
-    status:"with_qs",
-    activityLog:[...(boq.activityLog||[]),{time:Date.now(),user:"Engineering Team",action:`Engineering quantities submitted — forwarded to Quantity Survey Team${atts.length>(boq.attachments?.length||0)?` (${atts.length} attachment${atts.length!==1?"s":""})`:""}` }]
-  },"engineering_submitted");
-
-  return(
-    <div className="fade-in">
-      {/* ── Top action bar ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,padding:"14px 18px",background:"var(--surface)",border:`1px solid ${locked?"var(--border)":"var(--eng)40"}`,borderRadius:12,flexWrap:"wrap",gap:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <Btn variant="ghost" small onClick={onBack}>← Back</Btn>
-          <div style={{display:"flex",alignItems:"center",gap:12}}>
-            <h1 style={{fontFamily:"Sora",fontSize:20,fontWeight:700,margin:0}}>{boq.boqId}</h1>
-            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <Badge status={boq.status}/><TimeWithTeam boq={boq}/>
-              {sheets&&sheets.length>1&&<span style={{fontSize:11,color:"var(--eng)",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:20,padding:"2px 8px"}}>{sheets.length} sheets</span>}
-            </div>
-          </div>
-        </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <Btn variant="ghost" small onClick={()=>exportBoqExcel({...boq,items:flatItems},"engineering")}>⬇ Download Sheet</Btn>
-          {!locked
-            ? <Btn variant="success" onClick={submit}>Submit to Quantity Survey →</Btn>
-            : <div style={{fontSize:12,color:"var(--green)",background:"var(--s2)",padding:"6px 14px",borderRadius:8,border:"1px solid var(--border)",fontWeight:600}}>🔒 Submitted — with QS Team</div>
-          }
-        </div>
-      </div>
-
-      <Card style={{marginBottom:16}}>
-        <AttachmentsPanel attachments={atts} onAdd={att=>setAtts(p=>[...p,att])} canAdd={!locked}/>
-      </Card>
-
-      <Card style={{marginBottom:16}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:sheets&&sheets.length>1?12:14,flexWrap:"wrap",gap:8}}>
-          <h3 style={{fontFamily:"Sora",fontSize:16}}>📦 BOQ Items</h3>
-          {!locked&&<div style={{fontSize:12,color:"var(--muted)",background:"var(--s2)",padding:"5px 11px",borderRadius:8,border:"1px solid var(--border)"}}>✏️ Enter <strong style={{color:"var(--eng)"}}>Eng. Qty</strong> · Planning Qty is <strong style={{color:"var(--plan)"}}>locked</strong></div>}
-        </div>
-        <SheetTabs sheets={sheets} activeSheet={activeSheet} setActiveSheet={setActiveSheet} roleColor="var(--eng)"/>
-        <ItemsTable items={visibleItems} role="engineering" editField={locked?null:"engQty"} onUpdateItem={upd} stagesVisible={{eng:true,qs:false,site:false}}/>
-        <TotalBar items={visibleItems} showEng={true} showQS={false} showSite={false}/>
-      </Card>
-      <ActivityLog log={boq.activityLog}/>
-    </div>
-  );
-}
-
-// ─── QS: BOQ Detail ───────────────────────────────────────────────────────────
-function QSView({boq,onUpdate,onBack}){
-  const initSheets=boq.sheets
-    ? boq.sheets.map(s=>({...s,items:s.items.map(i=>({...i,qsQty:i.qsQty||0}))}))
-    : null;
-  const [sheets,setSheets]=useState(initSheets);
-  const [activeSheet,setActiveSheet]=useState(initSheets?initSheets[0].sheetName:null);
-  const [items,setItems]=useState(sheets?[]:boq.items.map(i=>({...i,qsQty:i.qsQty||0})));
-  const [atts,setAtts]=useState(boq.attachments||[]);
-  const locked=boq.status!=="with_qs";
-
-  const visibleItems=sheets
-    ? (sheets.find(s=>s.sheetName===activeSheet)?.items||[])
-    : items;
-
-  const upd=(id,f,v)=>{
-    if(f!=="qsQty") return;
-    if(sheets){
-      setSheets(p=>p.map(s=>s.sheetName===activeSheet
-        ? {...s,items:s.items.map(i=>i.id===id?{...i,qsQty:v}:i)}
-        : s));
-    } else {
-      setItems(p=>p.map(i=>i.id===id?{...i,qsQty:v}:i));
-    }
-  };
-
-  const flatItems=sheets?sheets.flatMap(s=>s.items):items;
-
-  const submit=()=>onUpdate({
-    ...boq,
-    sheets:sheets||boq.sheets,
-    items:flatItems,
-    attachments:atts,
-    status:"with_site",
-    activityLog:[...(boq.activityLog||[]),{time:Date.now(),user:"Quantity Survey Team",action:`QS quantities submitted — forwarded to Project Team`}]
-  },"qs_submitted");
-
-  return(
-    <div className="fade-in">
-      {/* ── Top action bar ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,padding:"14px 18px",background:"var(--surface)",border:`1px solid ${locked?"var(--border)":"var(--qs)40"}`,borderRadius:12,flexWrap:"wrap",gap:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <Btn variant="ghost" small onClick={onBack}>← Back</Btn>
-          <div style={{display:"flex",alignItems:"center",gap:12}}>
-            <h1 style={{fontFamily:"Sora",fontSize:20,fontWeight:700,margin:0}}>{boq.boqId}</h1>
-            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <Badge status={boq.status}/><TimeWithTeam boq={boq}/>
-              {sheets&&sheets.length>1&&<span style={{fontSize:11,color:"var(--qs)",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:20,padding:"2px 8px"}}>{sheets.length} sheets</span>}
-            </div>
-          </div>
-        </div>
-        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-          <Btn variant="ghost" small onClick={()=>exportBoqExcel({...boq,items:flatItems},"qs")}>⬇ Download Sheet</Btn>
-          {!locked
-            ? <Btn variant="amber" onClick={submit}>Submit to Project Team →</Btn>
-            : <div style={{fontSize:12,color:"var(--amber)",background:"var(--s2)",padding:"6px 14px",borderRadius:8,border:"1px solid var(--border)",fontWeight:600}}>🔒 Submitted — with Project Team</div>
-          }
-        </div>
-      </div>
-
-      <AlertBanner icon="⚙️" title="Engineering Quantities are locked" desc="Enter your QS quantities below to compare with Engineering." color="var(--eng)" bg="#0a2a1a"/>
-
-      <Card style={{marginBottom:16}}>
-        <AttachmentsPanel attachments={atts} onAdd={att=>setAtts(p=>[...p,att])} canAdd={!locked}/>
-      </Card>
-
-      <Card style={{marginBottom:16}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:sheets&&sheets.length>1?12:14,flexWrap:"wrap",gap:8}}>
-          <h3 style={{fontFamily:"Sora",fontSize:16}}>📦 BOQ Items</h3>
-          {!locked&&<div style={{fontSize:12,color:"var(--muted)",background:"var(--s2)",padding:"5px 11px",borderRadius:8,border:"1px solid var(--border)"}}>✏️ Enter <strong style={{color:"var(--qs)"}}>QS Qty</strong> — Eng. Qty is <strong style={{color:"var(--eng)"}}>locked</strong></div>}
-        </div>
-        <SheetTabs sheets={sheets} activeSheet={activeSheet} setActiveSheet={setActiveSheet} roleColor="var(--qs)"/>
-        <ItemsTable items={visibleItems} role="qs" editField={locked?null:"qsQty"} onUpdateItem={upd} stagesVisible={{eng:true,qs:true,site:false}}/>
-        <TotalBar items={visibleItems} showEng={true} showQS={true} showSite={false}/>
-      </Card>
-      <ActivityLog log={boq.activityLog}/>
-    </div>
-  );
-}
-
-// ─── Site: BOQ Detail ─────────────────────────────────────────────────────────
-function SiteView({boq,onUpdate,onBack,users=[]}){
-  const initSheets=boq.sheets
-    ? boq.sheets.map(s=>({...s,items:s.items.map(i=>({...i,siteQty:i.siteQty||0}))}))
-    : null;
-  const [sheets,setSheets]=useState(initSheets);
-  const [activeSheet,setActiveSheet]=useState(initSheets?initSheets[0].sheetName:null);
-  const [items,setItems]=useState(sheets?[]:boq.items.map(i=>({...i,siteQty:i.siteQty||0})));
-  const [atts,setAtts]=useState(boq.attachments||[]);
-  const locked=boq.status!=="with_site";
-
-  const visibleItems=sheets
-    ? (sheets.find(s=>s.sheetName===activeSheet)?.items||[])
-    : items;
-
-  const upd=(id,f,v)=>{
-    if(f!=="siteQty") return;
-    if(sheets){
-      setSheets(p=>p.map(s=>s.sheetName===activeSheet
-        ? {...s,items:s.items.map(i=>i.id===id?{...i,siteQty:v}:i)}
-        : s));
-    } else {
-      setItems(p=>p.map(i=>i.id===id?{...i,siteQty:v}:i));
-    }
-  };
-
-  const flatItems=sheets?sheets.flatMap(s=>s.items):items;
-
-  const submit=()=>onUpdate({
-    ...boq,
-    sheets:sheets||boq.sheets,
-    items:flatItems,
-    attachments:atts,
-    status:"completed",
-    activityLog:[...(boq.activityLog||[]),{time:Date.now(),user:"Project Team",action:"Site quantities submitted — BOQ Completed"}]
-  },"site_submitted");
-
-  return(
-    <div className="fade-in">
-      {/* ── Top action bar ── */}
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20,padding:"14px 18px",background:"var(--surface)",border:`1px solid ${locked?"var(--border)":"var(--site)40"}`,borderRadius:12,flexWrap:"wrap",gap:10}}>
-        <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <Btn variant="ghost" small onClick={onBack}>← Back</Btn>
-          <div style={{display:"flex",alignItems:"center",gap:12}}>
-            <h1 style={{fontFamily:"Sora",fontSize:20,fontWeight:700,margin:0}}>{boq.boqId}</h1>
-            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
-              <Badge status={boq.status}/><TimeWithTeam boq={boq}/>
-              {sheets&&sheets.length>1&&<span style={{fontSize:11,color:"var(--site)",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:20,padding:"2px 8px"}}>{sheets.length} sheets</span>}
-            </div>
-          </div>
-        </div>
-        <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
-          <Btn variant="outline" small onClick={()=>exportBoqExcel({...boq,items:flatItems},"site")}>⬇ Download Sheet</Btn>
-          {!locked
-            ? <Btn variant="rose" onClick={submit}>✅ Submit & Complete BOQ</Btn>
-            : <div style={{fontSize:12,color:"var(--green)",background:"var(--s2)",padding:"6px 14px",borderRadius:8,border:"1px solid var(--border)",fontWeight:600}}>✅ Completed</div>
-          }
-        </div>
-      </div>
-
-      <AlertBanner icon="📐" title="Planning, Engineering and QS Quantities are all locked" desc="You can see all previous quantities below. Enter your Site Qty — it will be compared against Engineering Qty." color="var(--site)" bg="#2a0010"/>
-
-      <Card style={{marginBottom:16}}>
-        <AttachmentsPanel attachments={atts} onAdd={att=>setAtts(p=>[...p,att])} canAdd={!locked}/>
-      </Card>
-
-      <Card style={{marginBottom:16}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:sheets&&sheets.length>1?12:14,flexWrap:"wrap",gap:8}}>
-          <h3 style={{fontFamily:"Sora",fontSize:16}}>📦 BOQ Items — Full View</h3>
-          {!locked&&<div style={{fontSize:12,color:"var(--muted)",background:"var(--s2)",padding:"5px 11px",borderRadius:8,border:"1px solid var(--border)"}}>✏️ Enter <strong style={{color:"var(--site)"}}>Site Qty</strong> — compared vs <strong style={{color:"var(--eng)"}}>Eng. Qty</strong></div>}
-          {locked&&<div style={{fontSize:12,color:"var(--site)",background:"#2a0010",padding:"5px 11px",borderRadius:8,border:"1px solid #f43f5e40"}}>✅ Completed</div>}
-        </div>
-        <SheetTabs sheets={sheets} activeSheet={activeSheet} setActiveSheet={setActiveSheet} roleColor="var(--site)"/>
-        <ItemsTable items={visibleItems} role="site" editField={locked?null:"siteQty"} onUpdateItem={upd} stagesVisible={{eng:true,qs:true,site:true}}/>
-        <TotalBar items={visibleItems} showEng={true} showQS={true} showSite={true}/>
-      </Card>
-      <ActivityLog log={boq.activityLog}/>
-      {locked&&<div style={{textAlign:"center",padding:12,background:"#052e16",borderRadius:10,border:"1px solid #10b98140",color:"var(--green)",marginTop:14}}>✅ BOQ fully completed by Project Team</div>}
-    </div>
-  );
-}
-
-
-// ─── Procurement Dashboard ────────────────────────────────────────────────────
-
-// Column indices (0-based) matching the expected Excel format
 const PROC_COL = {
   PROJECT_NAME: 2,   // C  - Project Name
   ITEM_NO:      5,   // F  - Item No (SAP Item Master — primary PO line key)
@@ -1764,6 +397,7 @@ const PROC_STATUS_CFG={
   CANCELLED:{color:"#64748b",bg:"var(--s3)",border:"var(--border)"},
   OVERDUE:  {color:"#ef4444",bg:"var(--s3)",border:"var(--border)"},
 };
+
 const procStatusCfg=(s,od)=>od?PROC_STATUS_CFG.OVERDUE:(PROC_STATUS_CFG[s]||{color:"var(--muted)",bg:"var(--s3)",border:"var(--border)"});
 
 function ProcStatusBadge({status,overdue}){
@@ -1801,7 +435,7 @@ function ProcItemsModal({doc,type,onClose}){
   const grid=isPR&&!prSingleVendor?"28px 140px 1fr 80px 80px 80px 80px":gridCols;
 
   return(
-    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"#00000088",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:24}} onClick={onClose}>
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"#00000088",zIndex:20000,display:"flex",alignItems:"center",justifyContent:"center",padding:24}} onClick={onClose}>
       <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,padding:24,maxWidth:isPO||(!prSingleVendor&&isPR)?1000:720,width:"100%",maxHeight:"75vh",display:"flex",flexDirection:"column"}} onClick={e=>e.stopPropagation()}>
 
         {/* ── Modal header ── */}
@@ -2062,6 +696,7 @@ function ProcDashPanel({type,docs,statusKey,dateKey,onItems}){
 // ── Main Procurement Page ─────────────────────────────────────────────────────
 // ─── Procurement Reports ──────────────────────────────────────────────────────
 // ─── Procurement Reports ──────────────────────────────────────────────────────
+
 const fmtAmt=v=>{v=v||0;if(v>=10000000)return"₹"+(v/10000000).toFixed(1)+" Cr";if(v>=100000)return"₹"+(v/100000).toFixed(1)+" L";if(v>=1000)return"₹"+(v/1000).toFixed(1)+" K";return"₹"+Math.round(v).toLocaleString("en-IN");};
 
 // ─── Overdue Alerts Panel ─────────────────────────────────────────────────────
@@ -2424,11 +1059,7 @@ function ExportButton({prs,pos,grpos,stats,label="Export"}){
 
       // ── Sheet 2: PRs ──────────────────────────────────────────────────────
       const prRows=[["PR No","PR Date","Required Date","Status","Owner","Project","Total Qty","Open Qty","Items"]];
-      prs.forEach(d=>prRows.push([d.prNo,d.prDate,d.prReqDate,d.prStatus,d.poOwner,d.projectName,d.totalQty,d.openQty,d.itemCount]));
-      XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(prRows),"Purchase Requests");
-
-      // ── Sheet 3: POs ──────────────────────────────────────────────────────
-      const poRows=[["PO No","PO Date","Exp Delivery","Status","Owner","Vendor","Project","Total Amount (₹)","Open Amount (₹)","Items"]];
+const poRows=[["PO No","PO Date","Exp Delivery","Status","Owner","Vendor","Project","Total Amount (₹)","Open Amount (₹)","Items"]];
       pos.forEach(d=>poRows.push([d.poNo,d.poDate,d.poExpDel,d.poStatus,d.poOwner,d.vendorName||"",d.projectName,Math.round(d.totalAmount||0),Math.round(d.openAmount||0),d.itemCount]));
       XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet(poRows),"Purchase Orders");
 
@@ -2459,6 +1090,287 @@ function ExportButton({prs,pos,grpos,stats,label="Export"}){
       <span>{exporting?"⏳":"📥"}</span>
       <span>{exporting?"Exporting…":label}</span>
     </button>
+  );
+}
+
+function ProjectGroupsModal({isOpen, onClose, projectGroups, setProjectGroups, allProjects}){
+  const [activeGroupKey, setActiveGroupKey] = useState("ACTIVE");
+  const [newGroupName, setNewGroupName] = useState("");
+  const [newGroupColor, setNewGroupColor] = useState("#8b5cf6");
+  const [newGroupIcon, setNewGroupIcon] = useState("🚀");
+  const [projSearchQuery, setProjSearchQuery] = useState("");
+  const [addProjSearchQuery, setAddProjSearchQuery] = useState("");
+
+  if(!isOpen) return null;
+
+  const activeGroup = projectGroups[activeGroupKey] || projectGroups["ACTIVE"] || Object.values(projectGroups)[0];
+
+  const COLORS = [
+    { name: "Purple", value: "#8b5cf6" },
+    { name: "Green", value: "#22c55e" },
+    { name: "Red", value: "#ef4444" },
+    { name: "Cyan", value: "#06b6d4" },
+    { name: "Amber", value: "#f59e0b" },
+    { name: "Pink", value: "#ec4899" },
+    { name: "Blue", value: "#3b82f6" }
+  ];
+
+  const ICONS = ["🟢", "🔴", "🏢", "🚀", "📦", "💡", "🛡️", "⚙️", "🌟", "🔥"];
+
+  const groupProjects = activeGroup?.projects || [];
+  const filteredGroupProjects = projSearchQuery
+    ? groupProjects.filter(p => p.toLowerCase().includes(projSearchQuery.toLowerCase()))
+    : groupProjects;
+
+  const availableProjects = allProjects.filter(p => !groupProjects.includes(p));
+  const filteredAvailable = addProjSearchQuery
+    ? availableProjects.filter(p => p.toLowerCase().includes(addProjSearchQuery.toLowerCase()))
+    : availableProjects;
+
+  const handleCreateGroup = (e) => {
+    e.preventDefault();
+    if(!newGroupName.trim()) return;
+    const key = "CUSTOM_" + Date.now();
+    const newGroup = {
+      key,
+      label: newGroupName.trim(),
+      projects: [],
+      color: newGroupColor,
+      icon: newGroupIcon,
+      isDefault: false
+    };
+    const updated = { ...projectGroups, [key]: newGroup };
+    setProjectGroups(updated);
+    localStorage.setItem("procurement_project_groups", JSON.stringify(updated));
+    setNewGroupName("");
+    setActiveGroupKey(key);
+  };
+
+  const handleDeleteGroup = (key) => {
+    console.log("handleDeleteGroup triggered for key:", key);
+    if (!key) return;
+    if (projectGroups[key]?.isDefault) {
+      console.log("Cannot delete default system group:", key);
+      return;
+    }
+    const updated = { ...projectGroups };
+    delete updated[key];
+    console.log("Remaining groups after deletion:", updated);
+    setProjectGroups(updated);
+    localStorage.setItem("procurement_project_groups", JSON.stringify(updated));
+    if (activeGroupKey === key) {
+      setActiveGroupKey("ACTIVE");
+    }
+  };
+
+  const handleAddProject = (p) => {
+    if(!activeGroup) return;
+    const updatedGroup = {
+      ...activeGroup,
+      projects: [...activeGroup.projects, p]
+    };
+    const updated = { ...projectGroups, [activeGroupKey]: updatedGroup };
+    setProjectGroups(updated);
+    localStorage.setItem("procurement_project_groups", JSON.stringify(updated));
+  };
+
+  const handleRemoveProject = (p) => {
+    if(!activeGroup) return;
+    const updatedGroup = {
+      ...activeGroup,
+      projects: activeGroup.projects.filter(proj => proj !== p)
+    };
+    const updated = { ...projectGroups, [activeGroupKey]: updatedGroup };
+    setProjectGroups(updated);
+    localStorage.setItem("procurement_project_groups", JSON.stringify(updated));
+  };
+
+  return (
+    <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"#000000bb",backdropFilter:"blur(6px)",zIndex:99999,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}
+      onClick={onClose}>
+      <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,width:"100%",maxWidth:850,height:"650px",display:"flex",flexDirection:"column",boxShadow:"0 20px 50px rgba(0,0,0,0.5)",overflow:"hidden"}}
+        onClick={e=>e.stopPropagation()}>
+        
+        <div style={{padding:"16px 20px",borderBottom:"1px solid var(--border)",display:"flex",alignItems:"center",justifyContent:"space-between",background:"var(--s2)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <span style={{fontSize:20}}>⚙️</span>
+            <div>
+              <div style={{fontSize:16,fontWeight:700,color:"var(--text)"}}>Manage Project Groups</div>
+              <div style={{fontSize:11,color:"var(--muted)",marginTop:2}}>Create and edit custom lists for filtering procurement data</div>
+            </div>
+          </div>
+          <button onClick={onClose} style={{background:"none",border:"1px solid var(--border)",borderRadius:8,color:"var(--muted)",fontSize:16,cursor:"pointer",width:32,height:32,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+
+        <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+          
+          <div style={{width:320,borderRight:"1px solid var(--border)",display:"flex",flexDirection:"column",background:"var(--s2)40",overflow:"hidden"}}>
+            <div style={{padding:"12px 16px",fontSize:12,fontWeight:700,color:"var(--muted)",textTransform:"uppercase",letterSpacing:"0.05em",borderBottom:"1px solid var(--border)"}}>
+              Groups List
+            </div>
+            
+            <div style={{flex:1,overflowY:"auto",padding:10,display:"flex",flexDirection:"column",gap:6}}>
+              {Object.entries(projectGroups).map(([k, g]) => {
+                const isActive = k === activeGroupKey;
+                return (
+                  <div key={k} onClick={() => setActiveGroupKey(k)}
+                    style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 12px",borderRadius:10,cursor:"pointer",background:isActive?"var(--s3)":"transparent",border:`1px solid ${isActive?g.color+"50":"transparent"}`,transition:"all 0.2s"}}
+                    onMouseEnter={e => { if(!isActive) e.currentTarget.style.background = "var(--s2)" }}
+                    onMouseLeave={e => { if(!isActive) e.currentTarget.style.background = "transparent" }}>
+                    <div style={{display:"flex",alignItems:"center",gap:10,minWidth:0,flex:1}}>
+                      <span style={{width:10,height:10,borderRadius:"50%",background:g.color||"#8b5cf6",flexShrink:0}}/>
+                      <div style={{minWidth:0,flex:1}}>
+                        <div style={{fontSize:13,fontWeight:600,color:isActive?g.color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{g.label}</div>
+                        <div style={{fontSize:10,color:"var(--muted)",marginTop:2}}>{g.projects.length} project{g.projects.length!==1?"s":""}</div>
+                      </div>
+                    </div>
+                    {!g.isDefault && (
+                      <button onClick={(e) => { e.stopPropagation(); handleDeleteGroup(k); }}
+                        style={{background:"none",border:"none",color:"var(--muted)",cursor:"pointer",fontSize:13,padding:"4px 8px",borderRadius:6}}
+                        onMouseEnter={e => e.currentTarget.style.color = "#ef4444"}
+                        onMouseLeave={e => e.currentTarget.style.color = "var(--muted)"}
+                        title="Delete Group">
+                        🗑️
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <form onSubmit={handleCreateGroup} style={{padding:16,borderTop:"1px solid var(--border)",background:"var(--s2)80",display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{fontSize:12,fontWeight:700,color:"var(--text)"}}>Create New Group</div>
+              <input value={newGroupName} onChange={e=>setNewGroupName(e.target.value)} placeholder="Group Name (e.g. NCR Projects)" required
+                style={{width:"100%",background:"var(--surface)",border:"1px solid var(--border)",borderRadius:8,padding:"7px 10px",color:"var(--text)",fontSize:12,outline:"none"}}/>
+              
+              
+
+              <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                <span style={{fontSize:10,color:"var(--muted)"}}>Select Color Theme</span>
+                <div style={{display:"flex",gap:5}}>
+                  {COLORS.map(c => (
+                    <button key={c.value} type="button" onClick={() => setNewGroupColor(c.value)}
+                      style={{width:16,height:16,borderRadius:"50%",background:c.value,border:newGroupColor===c.value?"2px solid var(--text)":"1px solid transparent",cursor:"pointer",padding:0}}
+                      title={c.name}/>
+                  ))}
+                </div>
+              </div>
+
+              <button type="submit"
+                style={{width:"100%",marginTop:4,padding:"8px 12px",borderRadius:8,background:"var(--accent)",color:"var(--surface)",fontSize:12,fontWeight:700,border:"none",cursor:"pointer",textAlign:"center"}}>
+                ➕ Create Group
+              </button>
+            </form>
+          </div>
+
+          <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+            
+            <div style={{padding:"12px 20px",borderBottom:"1px solid var(--border)",background:"var(--s2)10",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+              <div>
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+              <span style={{width:12,height:12,borderRadius:"50%",background:activeGroup?.color||"#8b5cf6",flexShrink:0}}/>
+              <span style={{fontSize:15,fontWeight:700,color:activeGroup?.color}}>{activeGroup?.label}</span>
+              {activeGroup?.isDefault && <span style={{fontSize:9,background:"var(--border)",color:"var(--muted)",borderRadius:4,padding:"1px 5px",fontWeight:600}}>System Group</span>}
+              </div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <div style={{fontSize:11,color:"var(--muted)"}}>{groupProjects.length} project{groupProjects.length!==1?"s":""} configured</div>
+              {!activeGroup?.isDefault && (
+              <button onClick={() => handleDeleteGroup(activeGroupKey)}
+              style={{background:"#ef444415",border:"1px solid #ef444430",borderRadius:6,color:"#ef4444",cursor:"pointer",fontSize:11,fontWeight:700,padding:"4px 10px",display:"flex",alignItems:"center",gap:4,transition:"all 0.15s"}}
+              onMouseEnter={e => {
+              e.currentTarget.style.background = "#ef4444";
+              e.currentTarget.style.color = "#fff";
+              }}
+              onMouseLeave={e => {
+              e.currentTarget.style.background = "#ef444415";
+              e.currentTarget.style.color = "#ef4444";
+              }}>
+              🗑️ Delete Group
+              </button>
+              )}
+              </div>
+              </div>
+
+            <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+              
+              <div style={{flex:1,borderRight:"1px solid var(--border)",display:"flex",flexDirection:"column",overflow:"hidden"}}>
+                <div style={{padding:"8px 16px",background:"var(--s2)20",borderBottom:"1px solid var(--border)",display:"flex",gap:6,alignItems:"center"}}>
+                  <input value={projSearchQuery} onChange={e=>setProjSearchQuery(e.target.value)} placeholder="Filter current projects…"
+                    style={{flex:1,background:"var(--surface)",border:"1px solid var(--border)",borderRadius:6,padding:"4px 8px",color:"var(--text)",fontSize:11,outline:"none"}}/>
+                </div>
+                
+                <div style={{flex:1,overflowY:"auto",padding:10,display:"flex",flexDirection:"column",gap:4}}>
+                  {filteredGroupProjects.length === 0 ? (
+                    <div style={{textAlign:"center",padding:"40px 0",color:"var(--muted)",fontSize:12}}>
+                      {groupProjects.length === 0 ? "No projects in this group yet" : "No matching projects found"}
+                    </div>
+                  ) : (
+                    filteredGroupProjects.map(p => (
+                      <div key={p} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"8px 10px",borderRadius:8,background:"var(--s2)30",border:"1px solid var(--border)"}}>
+                        <span style={{fontSize:12,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,paddingRight:8}} title={p}>{p}</span>
+                        <button onClick={() => handleRemoveProject(p)}
+                          style={{background:"none",border:"none",color:"var(--muted)",cursor:"pointer",fontSize:11,padding:4}}
+                          onMouseEnter={e => e.currentTarget.style.color = "#ef4444"}
+                          onMouseLeave={e => e.currentTarget.style.color = "var(--muted)"}
+                          title="Remove from Group">
+                          ✕
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden"}}>
+                <div style={{padding:"8px 16px",background:"var(--s2)20",borderBottom:"1px solid var(--border)",display:"flex",gap:6,alignItems:"center"}}>
+                  <input value={addProjSearchQuery} onChange={e=>setAddProjSearchQuery(e.target.value)} placeholder="Search workspace projects to add…"
+                    style={{flex:1,background:"var(--surface)",border:"1px solid var(--border)",borderRadius:6,padding:"4px 8px",color:"var(--text)",fontSize:11,outline:"none"}}/>
+                </div>
+
+                <div style={{flex:1,overflowY:"auto",padding:10,display:"flex",flexDirection:"column",gap:4}}>
+                  {filteredAvailable.length === 0 ? (
+                    <div style={{textAlign:"center",padding:"40px 0",color:"var(--muted)",fontSize:12}}>
+                      {availableProjects.length === 0 ? "All available projects are already in this group" : "No matching projects found"}
+                    </div>
+                  ) : (
+                    filteredAvailable.map(p => (
+                      <div key={p} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"6px 10px",borderRadius:8,background:"transparent",border:"1px solid transparent"}}
+                        onMouseEnter={e => {
+                          e.currentTarget.style.background = "var(--s2)";
+                          e.currentTarget.style.borderColor = "var(--border)";
+                        }}
+                        onMouseLeave={e => {
+                          e.currentTarget.style.background = "transparent";
+                          e.currentTarget.style.borderColor = "transparent";
+                        }}>
+                        <span style={{fontSize:12,color:"var(--text)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",flex:1,paddingRight:8}} title={p}>{p}</span>
+                        <button onClick={() => handleAddProject(p)}
+                          style={{background:"var(--accent)15",border:"1px solid var(--accent)30",borderRadius:6,color:"var(--accent)",cursor:"pointer",fontSize:10,fontWeight:700,padding:"3px 8px"}}
+                          onMouseEnter={e => {
+                            e.currentTarget.style.background = "var(--accent)";
+                            e.currentTarget.style.color = "var(--surface)";
+                          }}
+                          onMouseLeave={e => {
+                            e.currentTarget.style.background = "var(--accent)15";
+                            e.currentTarget.style.color = "var(--accent)";
+                          }}>
+                          Add
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+
+            </div>
+
+          </div>
+
+        </div>
+
+      </div>
+    </div>
   );
 }
 
@@ -2526,6 +1438,7 @@ const getThreshold=g=>GROUP_PR_PO_THRESHOLD[g]??7;
 
 // ─── Pivot Drill-Down Modal ───────────────────────────────────────────────────
 function PivotDrillModal({project,type,filter,docs,onClose}){
+  const [drillItem, setDrillItem] = useState(null);
   const TYPE_CFG={
     PR: {color:"#8b5cf6",statusKey:"prStatus",  numKey:"prNo",   dateKey:"prDate",    dueDateKey:"prReqDate",  numLabel:"PR No",   dateLabel:"PR Date",   dueDateLabel:"Req. Date"},
     PO: {color:"#f0a030",statusKey:"poStatus",  numKey:"poNo",   dateKey:"poDate",    dueDateKey:"poExpDel",   numLabel:"PO No",   dateLabel:"PO Date",   dueDateLabel:"Exp. Delivery"},
@@ -2538,6 +1451,7 @@ function PivotDrillModal({project,type,filter,docs,onClose}){
   const sc=s=>s==="OPEN"?"#3b9eff":s==="CLOSED"?"#22c55e":s==="CANCELLED"?"#64748b":"#ef4444";
 
   return(
+    <>
     <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"#000000aa",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:24}}
       onClick={onClose}>
       <div style={{background:"var(--surface)",border:`1px solid ${cfg.color}40`,borderRadius:16,width:"100%",maxWidth:860,maxHeight:"80vh",display:"flex",flexDirection:"column",boxShadow:`0 0 40px ${cfg.color}20`}}
@@ -2590,7 +1504,13 @@ function PivotDrillModal({project,type,filter,docs,onClose}){
                       onMouseEnter={e=>e.currentTarget.style.background="var(--s3)"}
                       onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"transparent":"var(--s2)"}>
                       <td style={{padding:"9px 14px",fontSize:11,color:"var(--muted)",fontFamily:"monospace",borderBottom:"1px solid var(--border)"}}>{String(i+1).padStart(2,"0")}</td>
-                      <td style={{padding:"9px 14px",fontSize:13,fontWeight:700,color:cfg.color,fontFamily:"monospace",borderBottom:"1px solid var(--border)",whiteSpace:"nowrap"}}>{docNo}</td>
+                      <td style={{padding:"9px 14px",fontSize:13,fontWeight:700,color:cfg.color,fontFamily:"monospace",borderBottom:"1px solid var(--border)",whiteSpace:"nowrap"}}>
+                        <span onClick={() => setDrillItem(d)} style={{cursor:"pointer",textDecoration:"underline",textDecorationColor:cfg.color+"80",transition:"all 0.15s"}}
+                          onMouseEnter={e => e.currentTarget.style.color = "var(--text)"}
+                          onMouseLeave={e => e.currentTarget.style.color = cfg.color}>
+                          {docNo}
+                        </span>
+                      </td>
                       <td style={{padding:"9px 14px",fontSize:12,color:"var(--muted)",borderBottom:"1px solid var(--border)",whiteSpace:"nowrap"}}>{procFmtDate(d[cfg.dateKey])}</td>
                       <td style={{padding:"9px 14px",fontSize:12,color:isOD?"#ef4444":"var(--muted)",fontWeight:isOD?700:400,borderBottom:"1px solid var(--border)",whiteSpace:"nowrap"}}>{procFmtDate(d[cfg.dueDateKey])}{isOD&&" ⚠"}</td>
                       {type==="PO"&&<td style={{padding:"9px 14px",fontSize:12,color:"var(--text)",borderBottom:"1px solid var(--border)",whiteSpace:"nowrap",maxWidth:160,overflow:"hidden",textOverflow:"ellipsis"}}>{d.vendorName||"—"}</td>}
@@ -2617,19 +1537,20 @@ function PivotDrillModal({project,type,filter,docs,onClose}){
         </div>
       </div>
     </div>
+    {drillItem&&<ProcItemsModal doc={drillItem} type={type} onClose={()=>setDrillItem(null)}/>}
+    </>
   );
 }
 
 // ─── Project Pivot Panel ──────────────────────────────────────────────────────
-function ProjectPivotPanel({stats,dateFrom,dateTo,selCCS}){
+function ProjectPivotPanel({stats,dateFrom,dateTo,selCCS,projectGroups}){
   const [tab,setTab]=useState("summary"); // "summary" | "table"
   const [drill,setDrill]=useState(null); // {project,type,filter,docs}
   const {rows,totals,label,count}=stats;
 
   const fmtA=v=>{v=v||0;if(v>=10000000)return"₹"+(v/10000000).toFixed(2)+" Cr";if(v>=100000)return"₹"+(v/100000).toFixed(2)+" L";if(v>=1000)return"₹"+(v/1000).toFixed(1)+" K";return"₹"+Math.round(v).toLocaleString("en-IN");};
 
-  const isCCS=!!selCCS;
-  const headerColor=isCCS?"#06b6d4":"#8b5cf6";
+  const headerColor=selCCS==="ALL"?"#06b6d4":selCCS && projectGroups[selCCS]?projectGroups[selCCS].color:"#8b5cf6";
 
   // Summary card helper
   const SCard=({label,color,data,showAmt=false})=>(
@@ -2857,6 +1778,7 @@ function ProjectPivotPanel({stats,dateFrom,dateTo,selCCS}){
   );
 }
 
+
 function ProcurementDashboard(){
   const [procData,setProcData]=useState(null);
   const [loading,setLoading]=useState(false);
@@ -2894,6 +1816,92 @@ function ProcurementDashboard(){
   const [ownerSearch,setOwnerSearch]=useState("");
   const [ownerOpen,setOwnerOpen]=useState(false);
   const [selCCS,setSelCCS]=useState("");//""=off, "ALL"=all CCS, "CLOSED"=CCS closed, "ACTIVE"=CCS active
+  const [projectGroups, setProjectGroups] = useState(() => {
+    const saved = localStorage.getItem("procurement_project_groups");
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch (e) {
+        console.error("Failed to load project groups", e);
+      }
+    }
+    return {
+      ACTIVE: {
+        key: "ACTIVE",
+        label: "CCS — Active Projects",
+        projects: [
+          "TCS - SDB 1 - NCR",
+          "Growel_Mum",
+          "UBS - Emerald - Front Office - Savills - Mum",
+          "KRC - Cignus 2 - Mum",
+          "Eastbridge Hiranandani - Vikhroli - Mum",
+          "Kalpataru - Summit tower - Mulund - Mum",
+          "German Consulate - MUMB - 3.OG - Mum",
+          "Embassy-ESTZ-B1-Chn",
+          "PAREXEL - C&W - BLR",
+          "Persistent - Ph 2, 3 & 4 - Pune",
+          "KRC B94-97 - Pune",
+          "Ashirvad Pipes - HVAC - JLL - Hyd",
+          "Ashirwad Pipes - 33 KV HT Line - JLL- Hyd",
+          "UBS - Savills - Hyd",
+          "Sanofi - Ph 2 - Hyd"
+        ],
+        color: "#22c55e",
+        icon: "🟢",
+        isDefault: true
+      },
+      CLOSED: {
+        key: "CLOSED",
+        label: "CCS — Closed Projects",
+        projects: [
+          "IBM - EGL - Colliers - Blr",
+          "Manyata - Block L4 - Colliers - Blr",
+          "WS Central - 18th Fl - Blr",
+          "Visa - GF, 2Fl & 3Fl - Om sai Intex - Blr",
+          "HSBC - B4 - JLL - Blr",
+          "Evernorth - CBRE - Hyd",
+          "IVY - CBRE - Hyd",
+          "EA - Savills - Hyd",
+          "L&T - Seawood 412 office - Mum",
+          "Hiranandini - Centaurus - Mum",
+          "Sculpture Park - WTP - Mum",
+          "Asian Paints - Vessel - Parel - CBRE - Mum",
+          "Crisil - Powai - Mum",
+          "Morgan Stanley - Parivartan - Mum",
+          "BNP Paribas - L11 & L12 - Centaurus - Mum",
+          "KRC - PACT - Pune",
+          "Workspace Livspace - Pune",
+          "Embassy - Qubix Business Park - Colliers - Pune",
+          "Brookfield - 45 ICON (Block A & B) - Pune",
+          "Infosys - 7F - G1 Building - Pune",
+          "Infosys - SDB 03 - Raceway Works - Pune"
+        ],
+        color: "#ef4444",
+        icon: "🔴",
+        isDefault: true
+      }
+    };
+  });
+  const [showGroupsModal, setShowGroupsModal] = useState(false);
+
+  const allCCSProjects = useMemo(() => {
+    const s = new Set();
+    Object.values(projectGroups).forEach(g => {
+      g.projects.forEach(p => s.add(p));
+    });
+    return s;
+  }, [projectGroups]);
+
+  const activeProjSet = useMemo(() => {
+    if (selCCS === "ALL") {
+      return allCCSProjects;
+    }
+    if (selCCS && projectGroups[selCCS]) {
+      return new Set(projectGroups[selCCS].projects);
+    }
+    return selProjects;
+  }, [selCCS, allCCSProjects, projectGroups, selProjects]);
+
   const [selGroup,setSelGroup]=useState("");//empty=ALL
   const [ownerTab,setOwnerTab]=useState("overview"); // "overview" | "pr" | "po" | "grpo"
   const [convDrill,setConvDrill]=useState(null); // {pairs, title, groupName, bucket}
@@ -2929,7 +1937,6 @@ function ProcurementDashboard(){
   // ── When project/CCS selection changes, auto-update date range to that project's data ──
   useEffect(()=>{
     if(!procData)return;
-    const activeProjSet=selCCS==="ALL"?CCS_PROJECTS:selCCS==="CLOSED"?CCS_CLOSED:selCCS==="ACTIVE"?CCS_ACTIVE:selProjects;
     const prs=activeProjSet.size===0
       ?procData.prs
       :procData.prs.filter(d=>activeProjSet.has(d.projectName));
@@ -2940,7 +1947,7 @@ function ProcurementDashboard(){
     const minStr=minD.toISOString().slice(0,10);
     const maxStr=maxD.toISOString().slice(0,10);
     setDataRange({min:minStr,max:maxStr});
-  },[selProjects,selCCS,procData]);
+  },[activeProjSet,procData]);
 
   const allGroups=useMemo(()=>{
     if(!procData)return[];
@@ -2967,7 +1974,6 @@ function ProcurementDashboard(){
       {key:"PO",label:"Purchase Orders",docs:[],statusKey:"poStatus",dateKey:"poExpDel",color:"#f0a030"},
       {key:"GRPO",label:"Goods Receipts",docs:[],statusKey:"grpoStatus",dateKey:"matRecDate",color:"#10b981"},
     ];
-    const activeProjSet=selCCS==="ALL"?CCS_PROJECTS:selCCS==="CLOSED"?CCS_CLOSED:selCCS==="ACTIVE"?CCS_ACTIVE:selProjects;
     const byProj=d=>activeProjSet.size===0||activeProjSet.has(d.projectName);
     const byOwner=d=>selOwners.size===0||selOwners.has(d.poOwner);
     const byGroup=d=>!selGroup||d.groupName===selGroup;
@@ -2995,14 +2001,13 @@ function ProcurementDashboard(){
       {key:"PO",   label:"Purchase Orders",   docs:procData.pos.filter(filt),   statusKey:"poStatus",   dateKey:"poExpDel",   color:"#f0a030"},
       {key:"GRPO", label:"Goods Receipts",    docs:procData.grpos.filter(filt), statusKey:"grpoStatus", dateKey:"matRecDate", color:"#10b981"},
     ];
-  },[procData,selProjects,selOwners,selCCS,selGroup,dateFrom,dateTo]);
+  },[procData,activeProjSet,selOwners,selGroup,dateFrom,dateTo]);
 
   // ── Owner stats (for the owner dashboard view) ────────────────────────────
   const ownerStats=useMemo(()=>{
     if(!procData||selOwners.size!==1)return null;
     const soloOwner=[...selOwners][0];
-    const activeProjSet2=selCCS==="ALL"?new Set(CCS_PROJECTS):selCCS==="CLOSED"?new Set(CCS_CLOSED):selCCS==="ACTIVE"?new Set(CCS_ACTIVE):selProjects;
-    const matchProj=d=>activeProjSet2.size===0||activeProjSet2.has(d.projectName);
+    const matchProj=d=>activeProjSet.size===0||activeProjSet.has(d.projectName);
     const prs=procData.prs.filter(d=>d.poOwner===soloOwner&&matchProj(d));
     const pos=procData.pos.filter(d=>d.poOwner===soloOwner&&matchProj(d));
     const grpos=procData.grpos.filter(d=>d.poOwner===soloOwner&&matchProj(d));
@@ -3109,12 +2114,11 @@ function ProcurementDashboard(){
       poToGrpo:{avg:avg(poToGrpoDays),med:med(poToGrpoDays),min:min(poToGrpoDays),max:max(poToGrpoDays),count:poToGrpoDays.length},
       groupStats,
     };
-  },[procData,selOwners,selProjects,selCCS]);
+  },[procData,selOwners,activeProjSet]);
 
   // ── Project pivot stats — triggers when any project selection is active ───────
   const projectStats=useMemo(()=>{
     // Always show when project(s) selected OR CCS filter active (even alongside owner filter)
-    const activeProjSet=selCCS==="ALL"?CCS_PROJECTS:selCCS==="CLOSED"?CCS_CLOSED:selCCS==="ACTIVE"?CCS_ACTIVE:selProjects;
     if(!procData||activeProjSet.size===0)return null;
     // Use the already-date-filtered docs from filteredTabs so date range is respected
     const prs=filteredTabs[0].docs;
@@ -3153,10 +2157,10 @@ function ProcurementDashboard(){
       totals.grpo.lineTotal+=r.grpo.lineTotal;totals.grpo.openAmt+=r.grpo.openAmt;
     });
 
-    const label=selCCS==="ALL"?"CCS — All Projects":selCCS==="CLOSED"?"CCS — Closed Projects":selCCS==="ACTIVE"?"CCS — Active Projects":
+    const label=selCCS==="ALL"?"CCS — All Projects":selCCS && projectGroups[selCCS]?projectGroups[selCCS].label:
       activeProjSet.size===1?[...activeProjSet][0]:activeProjSet.size+" Projects Selected";
     return{rows,totals,label,count:activeProjSet.size};
-  },[filteredTabs,procData,selProjects,selCCS]);
+  },[filteredTabs,procData,activeProjSet,selCCS,projectGroups]);
 
   const active=filteredTabs.find(t=>t.key===activeTab);
 
@@ -3344,11 +2348,23 @@ function ProcurementDashboard(){
         <Dropdown label="Filter by Project" icon="🏗️" isOpen={projOpen} setOpen={setProjOpen} setSearch={setProjSearch}
           selected={selProjects.size>0?"x":null} onClear={()=>{setSelProjects(new Set());setProjOpen(false);setSelCCS("");}}
           trigger={<span style={{flex:1,fontSize:13,color:selProjects.size===0&&!selCCS?"var(--muted)":"var(--text)",fontWeight:selProjects.size===0&&!selCCS?400:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-            {selCCS==="ALL"?"CCS — All ("+CCS_PROJECTS.size+")":selCCS==="CLOSED"?"CCS — Closed ("+CCS_CLOSED.size+")":selCCS==="ACTIVE"?"CCS — Active ("+CCS_ACTIVE.size+")":selProjects.size===0?"All Projects ("+procData.projects.length+")":selProjects.size===1?[...selProjects][0]:selProjects.size+" projects selected"}
+            {selCCS === "ALL" 
+              ? "CCS — All (" + allCCSProjects.size + ")" 
+              : selCCS && projectGroups[selCCS] 
+                ? projectGroups[selCCS].label + " (" + projectGroups[selCCS].projects.length + ")" 
+                : selProjects.size === 0 
+                  ? "All Projects (" + procData.projects.length + ")" 
+                  : selProjects.size === 1 
+                    ? [...selProjects][0] 
+                    : selProjects.size + " projects selected"}
           </span>}>
           <div style={{padding:"8px 10px",borderBottom:"1px solid var(--border)",display:"flex",gap:6,alignItems:"center"}}>
             <input value={projSearch} onChange={e=>setProjSearch(e.target.value)} placeholder="Search projects…" autoFocus
               style={{flex:1,background:"var(--s2)",border:"1px solid var(--border)",borderRadius:7,padding:"7px 10px",color:"var(--text)",fontSize:12,outline:"none"}}/>
+            <button onClick={(e)=>{e.stopPropagation(); setShowGroupsModal(true); setProjOpen(false);}}
+              style={{fontSize:11,color:"var(--accent)",background:"var(--accent)12",border:"1px solid var(--accent)30",borderRadius:6,padding:"5px 8px",cursor:"pointer",display:"flex",alignItems:"center",gap:4,fontWeight:600}}>
+              <span>⚙️</span> Manage
+            </button>
             {selProjects.size>0&&<button onClick={()=>setSelProjects(new Set())}
               style={{fontSize:11,color:"var(--muted)",background:"none",border:"1px solid var(--border)",borderRadius:6,padding:"4px 8px",cursor:"pointer"}}>Clear</button>}
           </div>
@@ -3359,23 +2375,27 @@ function ProcurementDashboard(){
                 style={{padding:"8px 12px",cursor:"pointer",background:selProjects.size===0&&!selCCS?"var(--s3)":"transparent",borderBottom:"1px solid var(--border)"}}
                 onMouseEnter={e=>{if(selProjects.size>0||selCCS)e.currentTarget.style.background="var(--s2)"}}
                 onMouseLeave={e=>{e.currentTarget.style.background=selProjects.size===0&&!selCCS?"var(--s3)":"transparent"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
                   <span style={{fontSize:13,color:selProjects.size===0&&!selCCS?"var(--accent)":"var(--text)",fontWeight:selProjects.size===0&&!selCCS?700:400,flex:1}}>All Projects</span>
                   <span style={{fontSize:10,color:"var(--muted)",fontFamily:"monospace"}}>{procData.projects.length}</span>
                 </div>
               </div>
             )}
-            {/* CCS options — 3 rows */}
+            {/* Custom & System Groups options */}
             {(!projSearch)&&[
-              {key:"ALL",   label:"🏢 CCS — All Projects",    count:CCS_PROJECTS.size, color:"#06b6d4"},
-              {key:"ACTIVE",label:"🟢 CCS — Active Projects",  count:CCS_ACTIVE.size,   color:"#22c55e"},
-              {key:"CLOSED",label:"🔴 CCS — Closed Projects",  count:CCS_CLOSED.size,   color:"#ef4444"},
+              {key:"ALL",   label:"🏢 CCS — All Projects",    count:allCCSProjects.size, color:"#06b6d4"},
+              ...Object.entries(projectGroups).map(([k, g]) => ({
+                key: g.key,
+                label: `📁 ${g.label}`,
+                count: g.projects.length,
+                color: g.color
+              }))
             ].map(opt=>(
               <div key={opt.key} onClick={()=>{setSelCCS(v=>v===opt.key?"":opt.key);setSelProjects(new Set());}}
-                style={{padding:"8px 12px",cursor:"pointer",background:selCCS===opt.key?"var(--s3)":"transparent",borderBottom:opt.key==="CLOSED"?"2px solid var(--border)":"1px solid var(--border)"}}
+                style={{padding:"8px 12px",cursor:"pointer",background:selCCS===opt.key?"var(--s3)":"transparent",borderBottom:opt.key==="CLOSED"||opt.key===Object.keys(projectGroups)[Object.keys(projectGroups).length - 1]?"2px solid var(--border)":"1px solid var(--border)"}}
                 onMouseEnter={e=>{if(selCCS!==opt.key)e.currentTarget.style.background="var(--s2)"}}
                 onMouseLeave={e=>{e.currentTarget.style.background=selCCS===opt.key?"var(--s3)":"transparent"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
                   <span style={{width:14,height:14,borderRadius:3,border:"2px solid",borderColor:selCCS===opt.key?opt.color:"var(--border)",background:selCCS===opt.key?opt.color:"transparent",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
                     {selCCS===opt.key&&<span style={{color:"#fff",fontSize:9,fontWeight:900}}>✓</span>}
                   </span>
@@ -3385,7 +2405,7 @@ function ProcurementDashboard(){
               </div>
             ))}
             {filteredProjects.map(p=>{
-              const isSel=selProjects.has(p)||(selCCS==="ALL"&&CCS_PROJECTS.has(p))||(selCCS==="ACTIVE"&&CCS_ACTIVE.has(p))||(selCCS==="CLOSED"&&CCS_CLOSED.has(p));
+              const isSel=selProjects.has(p)||(selCCS && activeProjSet.has(p));
               const prc=(projCounts[p]?.pr||0);
               return(
                 <div key={p} onClick={()=>{
@@ -3395,13 +2415,21 @@ function ProcurementDashboard(){
                   style={{padding:"8px 12px",cursor:"pointer",background:isSel?"var(--s3)":"transparent",borderBottom:"1px solid var(--border)"}}
                   onMouseEnter={e=>{if(!isSel)e.currentTarget.style.background="var(--s2)"}}
                   onMouseLeave={e=>{if(!isSel)e.currentTarget.style.background=isSel?"var(--s3)":"transparent"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
                     <span style={{width:14,height:14,borderRadius:3,border:"2px solid",borderColor:isSel?"var(--accent)":"var(--border)",background:isSel?"var(--accent)":"transparent",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
                       {isSel&&<span style={{color:"#fff",fontSize:9,fontWeight:900}}>✓</span>}
                     </span>
                     <span style={{fontSize:12,color:isSel?"var(--accent)":"var(--text)",fontWeight:isSel?700:400,flex:1}}>{p}</span>
-                    {CCS_ACTIVE.has(p)&&<span style={{fontSize:9,color:"#22c55e",background:"#22c55e15",border:"1px solid #22c55e30",borderRadius:4,padding:"1px 5px"}}>CCS Active</span>}
-                    {CCS_CLOSED.has(p)&&<span style={{fontSize:9,color:"#ef4444",background:"#ef444415",border:"1px solid #ef444430",borderRadius:4,padding:"1px 5px"}}>CCS Closed</span>}
+                    {Object.entries(projectGroups).map(([k, g]) => {
+                      if (g.projects.includes(p)) {
+                        return (
+                          <span key={k} style={{fontSize:9,color:g.color,background:g.color+"15",border:`1px solid ${g.color}30`,borderRadius:4,padding:"1px 5px",marginLeft:4}}>
+                            {g.key === "ACTIVE" ? "CCS Active" : g.key === "CLOSED" ? "CCS Closed" : g.label}
+                          </span>
+                        );
+                      }
+                      return null;
+                    })}
                   </div>
                   <div style={{display:"flex",gap:8,marginTop:2,paddingLeft:22}}>
                     <span style={{fontSize:10,color:"#8b5cf6"}}>{prc} PRs</span>
@@ -3418,11 +2446,14 @@ function ProcurementDashboard(){
           <div style={{display:"flex",gap:5,flexWrap:"wrap",marginTop:8,alignItems:"center"}}>
             {selCCS&&(
               <span style={{display:"flex",alignItems:"center",gap:4,
-                background:selCCS==="ACTIVE"?"#22c55e15":selCCS==="CLOSED"?"#ef444415":"#06b6d410",
-                border:`1px solid ${selCCS==="ACTIVE"?"#22c55e40":selCCS==="CLOSED"?"#ef444440":"#06b6d440"}`,
+                background:selCCS === "ALL" ? "#06b6d410" : projectGroups[selCCS] ? projectGroups[selCCS].color + "15" : "#06b6d410",
+                border:`1px solid ${selCCS === "ALL" ? "#06b6d440" : projectGroups[selCCS] ? projectGroups[selCCS].color + "40" : "#06b6d440"}`,
                 borderRadius:20,padding:"3px 10px",fontSize:11,
-                color:selCCS==="ACTIVE"?"#22c55e":selCCS==="CLOSED"?"#ef4444":"#06b6d4",fontWeight:600}}>
-                {selCCS==="ALL"?"🏢 CCS All ("+CCS_PROJECTS.size+")":selCCS==="ACTIVE"?"🟢 CCS Active ("+CCS_ACTIVE.size+")":"🔴 CCS Closed ("+CCS_CLOSED.size+")"}
+                color:selCCS === "ALL" ? "#06b6d4" : projectGroups[selCCS] ? projectGroups[selCCS].color : "#06b6d4",fontWeight:600}}>
+                {selCCS === "ALL" ? `🏢 CCS All (${allCCSProjects.size})` : (() => {
+                  const g = projectGroups[selCCS];
+                  return g ? `📁 ${g.label} (${g.projects.length})` : "";
+                })()}
                 <button onClick={()=>setSelCCS("")} style={{background:"none",border:"none",color:"inherit",cursor:"pointer",padding:0,fontSize:12,lineHeight:1}}>×</button>
               </span>
             )}
@@ -3458,7 +2489,7 @@ function ProcurementDashboard(){
                   style={{padding:"8px 12px",cursor:"pointer",background:isSel?"var(--s3)":"transparent",borderBottom:"1px solid var(--border)"}}
                   onMouseEnter={e=>{if(!isSel)e.currentTarget.style.background="var(--s2)"}}
                   onMouseLeave={e=>{if(!isSel)e.currentTarget.style.background=isSel?"var(--s3)":"transparent"}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
                     <span style={{width:14,height:14,borderRadius:3,border:"2px solid",borderColor:isSel?"var(--accent)":"var(--border)",background:isSel?"var(--accent)":"transparent",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"center"}}>
                       {isSel&&<span style={{color:"#fff",fontSize:9,fontWeight:900}}>✓</span>}
                     </span>
@@ -3489,7 +2520,7 @@ function ProcurementDashboard(){
 
         {/* ── Date Range column ── */}
         <div style={{position:"relative"}}>
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:"var(--muted)",textTransform:"uppercase",marginBottom:6,display:"flex",alignItems:"center",gap:8}}>
+          <div style={{fontSize:10,fontWeight:700,letterSpacing:"0.1em",color:"var(--muted)",textTransform:"uppercase",marginBottom:6,display:"flex",alignItems:"center",gap:10}}>
             <span>Filter by PR Creation Date</span>
             {dateActive&&(
               <button onClick={()=>{setDateFrom("");setDateTo("");}}
@@ -3512,7 +2543,7 @@ function ProcurementDashboard(){
 
               {/* ── Data range banner ── */}
               {dataRange&&(
-                <div style={{background:"var(--s3)",border:"1px solid var(--border)",borderRadius:8,padding:"8px 12px",marginBottom:14,display:"flex",alignItems:"center",justifyContent:"space-between",gap:8}}>
+                <div style={{background:"var(--s3)",border:"1px solid var(--border)",borderRadius:8,padding:"8px 12px",marginBottom:14,display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
                   <div>
                     <div style={{fontSize:10,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:2}}>📊 Data Range in File</div>
                     <div style={{fontSize:12,color:"var(--green)",fontWeight:700,fontFamily:"monospace"}}>{dataRange.min} → {dataRange.max}</div>
@@ -3638,7 +2669,7 @@ function ProcurementDashboard(){
                 <div style={{fontSize:11,color:"var(--muted)",marginTop:1}}>
                   {gStat.prToPo.count} PR→PO pairs · {gStat.poToGrpo.count} PO→GRPO pairs
                   {selOwners.size>0&&<span style={{marginLeft:6,color:"var(--accent)"}}>· {selOwners.size} owner{selOwners.size!==1?"s":""} filtered</span>}
-                  {(selProjects.size>0||selCCS)&&<span style={{marginLeft:6,color:"#8b5cf6"}}>· {selCCS==="ALL"?"CCS All":selCCS==="ACTIVE"?"CCS Active":selCCS==="CLOSED"?"CCS Closed":selProjects.size+" project(s)"} filtered</span>}
+                  {(selProjects.size>0||selCCS)&&<span style={{marginLeft:6,color:"#8b5cf6"}}>· {selCCS === "ALL" ? "CCS All" : projectGroups[selCCS] ? projectGroups[selCCS].label : selProjects.size+" project(s)"} filtered</span>}
                 </div>
               </div>
             </div>
@@ -3691,6 +2722,7 @@ function ProcurementDashboard(){
           stats={projectStats}
           dateFrom={dateFrom} dateTo={dateTo}
           selCCS={selCCS}
+          projectGroups={projectGroups}
         />
       )}
 
@@ -3786,7 +2818,7 @@ function ProcurementDashboard(){
                       style={{flex:1,background:b.bg,border:`1px solid ${b.color}30`,borderRadius:7,padding:"6px 4px",textAlign:"center",
                         cursor:b.pairs.length?"pointer":"default",transition:"all .15s",opacity:b.pairs.length?1:0.4}}
                       onMouseEnter={e=>{if(b.pairs.length)e.currentTarget.style.borderColor=b.color+"80";}}
-                      onMouseLeave={e=>{e.currentTarget.style.borderColor=b.color+"30";}}>
+                      onMouseLeave={e=>{if(b.pairs.length)e.currentTarget.style.borderColor=b.color+"30";}}>
                       <div style={{fontSize:16,fontWeight:800,color:b.color,fontFamily:"monospace",lineHeight:1}}>{b.pairs.length}</div>
                       <div style={{fontSize:9,color:b.color,fontWeight:600,marginTop:2}}>{b.label}</div>
                       <div style={{fontSize:9,color:"var(--muted)"}}>{b.sublabel}</div>
@@ -3878,7 +2910,7 @@ function ProcurementDashboard(){
               const isAct=activeTab===t.key;
               return(
                 <button key={t.key} onClick={()=>setActiveTab(t.key)}
-                  style={{padding:"11px 20px",border:"none",background:"transparent",color:isAct?t.color:"var(--muted)",fontSize:13,fontWeight:700,cursor:"pointer",borderBottom:isAct?`2px solid ${t.color}`:"2px solid transparent",transition:"all .15s",display:"flex",alignItems:"center",gap:8}}>
+                  style={{padding:"11px 20px",border:"none",background:"transparent",color:isAct?t.color:"var(--muted)",fontSize:13,fontWeight:700,cursor:"pointer",borderBottom:isAct?`2px solid ${t.color}`:"2px solid transparent",transition:"all .15s",display:"flex",alignItems:"center",gap:10}}>
                   <span>{t.key}</span>
                   <span style={{fontSize:11,color:isAct?"var(--text)":"var(--muted)",opacity:isAct?0.8:0.6}}>—</span>
                   <span style={{fontSize:11,color:isAct?"var(--text)":"var(--muted)",opacity:isAct?0.8:0.6}}>{t.label}</span>
@@ -3910,13 +2942,20 @@ function ProcurementDashboard(){
                   </div>
                 </div>
               </div>
-              <ProcDashPanel key={activeTab+[...selProjects].join(",")+[...selOwners].join(",")} type={active.key} docs={active.docs} statusKey={active.statusKey} dateKey={active.dateKey} onItems={(doc,type)=>setModal({doc,type})}/>
+              <ProcDashPanel key={activeTab+[...activeProjSet].join(",")+[...selOwners].join(",")} type={active.key} docs={active.docs} statusKey={active.statusKey} dateKey={active.dateKey} onItems={(doc,type)=>setModal({doc,type})}/>
             </>)
           }
         </>
       )}
 
       {modal&&<ProcItemsModal doc={modal.doc} type={modal.type} onClose={()=>setModal(null)}/>}
+      <ProjectGroupsModal
+        isOpen={showGroupsModal}
+        onClose={() => setShowGroupsModal(false)}
+        projectGroups={projectGroups}
+        setProjectGroups={setProjectGroups}
+        allProjects={procData?.projects || []}
+      />
       {convDrill&&(
         <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"#00000088",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:24}} onClick={()=>setConvDrill(null)}>
           <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:16,padding:24,maxWidth:860,width:"100%",maxHeight:"78vh",display:"flex",flexDirection:"column"}} onClick={e=>e.stopPropagation()}>
@@ -3974,366 +3013,7 @@ function ProcurementDashboard(){
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
 // ─── BOQ Table used inside Reports ───────────────────────────────────────────
-function ReportBOQTable({list,onSelect,users=[]}){
-  if(list.length===0) return(
-    <div style={{textAlign:"center",padding:"36px 0",color:"var(--muted)"}}>
-      <div style={{fontSize:36,marginBottom:8}}>📭</div>No BOQs found
-    </div>
-  );
-  return(
-    <table>
-      <thead><tr>
-        <th>BOQ ID</th><th>Created By</th><th>Date</th><th style={{textAlign:"center"}}>Items</th>
-        <th style={{textAlign:"center",color:"var(--plan)"}}>Plan</th>
-        <th style={{textAlign:"center",color:"var(--eng)"}}>Eng.</th>
-        <th style={{textAlign:"center",color:"var(--qs)"}}>QS</th>
-        <th style={{textAlign:"center",color:"var(--site)"}}>Site</th>
-        <th/>
-      </tr></thead>
-      <tbody>
-        {list.slice().reverse().map(b=>{
-          const creator=users.find(u=>u.id===b.createdBy);
-          const pt=b.items.reduce((s,i)=>s+(i.planQty||0),0);
-          const et=b.items.reduce((s,i)=>s+(i.engQty||0),0);
-          const qt=b.items.reduce((s,i)=>s+(i.qsQty||0),0);
-          const st=b.items.reduce((s,i)=>s+(i.siteQty||0),0);
-          return(
-            <tr key={b.id}>
-              <td style={{fontFamily:"monospace",fontSize:12,fontWeight:600}}>{b.boqId}</td>
-              <td style={{fontSize:12}}>{creator?.name||"—"}</td>
-              <td style={{color:"var(--muted)",fontSize:12}}>{new Date(b.createdAt).toLocaleDateString()}</td>
-              <td style={{textAlign:"center"}}>{b.items.length}</td>
-              <td style={{textAlign:"center",fontWeight:600,color:"var(--plan)"}}>{pt.toLocaleString()}</td>
-              <td style={{textAlign:"center",fontWeight:600,color:et>0?"var(--eng)":"var(--muted)"}}>{et>0?et.toLocaleString():"—"}</td>
-              <td style={{textAlign:"center",fontWeight:600,color:qt>0?"var(--qs)":"var(--muted)"}}>{qt>0?qt.toLocaleString():"—"}</td>
-              <td style={{textAlign:"center",fontWeight:600,color:st>0?"var(--site)":"var(--muted)"}}>{st>0?st.toLocaleString():"—"}</td>
-              <td><Btn small variant="outline" onClick={()=>onSelect(b)}>View →</Btn></td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
-  );
-}
 
-// ─── Status Section Card (clickable, expands inline) ─────────────────────────
-function StatusSection({statusKey,meta,boqs,activeStatus,setActiveStatus,onSelect,users=[]}){
-  const list=boqs.filter(b=>b.status===statusKey);
-  const isActive=activeStatus===statusKey;
-  return(
-    <div style={{marginBottom:12}}>
-      {/* Header row — clickable */}
-      <div onClick={()=>setActiveStatus(isActive?null:statusKey)}
-        style={{display:"flex",alignItems:"center",gap:14,background:"var(--surface)",border:`2px solid ${isActive?meta.color:"var(--border)"}`,borderRadius:isActive?"14px 14px 0 0":14,padding:"14px 18px",cursor:"pointer",transition:"all .2s",boxShadow:isActive?`0 0 18px ${meta.color}25`:"none"}}
-        onMouseEnter={e=>{if(!isActive)e.currentTarget.style.borderColor=`${meta.color}60`;}}
-        onMouseLeave={e=>{if(!isActive)e.currentTarget.style.borderColor="var(--border)";}}>
-        <div style={{width:12,height:12,borderRadius:"50%",background:meta.color,flexShrink:0,boxShadow:isActive?`0 0 8px ${meta.color}`:"none"}}/>
-        <div style={{flex:1}}>
-          <div style={{fontSize:14,fontWeight:700,color:isActive?meta.color:"var(--text)"}}>{meta.label}</div>
-          <div style={{fontSize:11,color:"var(--muted)",marginTop:1}}>{isActive?"Click to collapse":"Click to view BOQs"}</div>
-        </div>
-        <div style={{fontSize:28,fontFamily:"Sora",fontWeight:800,color:meta.color,minWidth:32,textAlign:"right"}}>{list.length}</div>
-        <div style={{fontSize:14,color:meta.color,marginLeft:8}}>{isActive?"▲":"▼"}</div>
-      </div>
-
-      {/* Expanded BOQ table */}
-      {isActive&&(
-        <div className="fade-in" style={{background:"var(--surface)",border:`2px solid ${meta.color}`,borderTop:"none",borderRadius:"0 0 14px 14px",padding:"0 0 4px 0",overflow:"hidden"}}>
-          <ReportBOQTable list={list} onSelect={onSelect} users={users}/>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Main Reports Component ───────────────────────────────────────────────────
-function Reports({boqs,user,onSelect,users=[]}){
-  const [activeStatus,setActiveStatus]=useState(null);
-  const isPlan=user.role==="planning";
-
-  // Pipeline stages shown as approval flow for planning
-  const PIPELINE=[
-    { key:"draft",           label:"1. Draft",                   icon:"📝", color:"#64748b", desc:"Created by Planning, not yet submitted" },
-    { key:"with_engineering",label:"2. Engineering Review",      icon:"⚙️", color:"#10b981", desc:"Awaiting Engineering quantities" },
-    { key:"with_qs",         label:"3. Quantity Survey Review",  icon:"📏", color:"#f59e0b", desc:"Awaiting QS quantities" },
-    { key:"with_site",       label:"4. Project Team Review",        icon:"🏗️", color:"#f43f5e", desc:"Awaiting Site quantities" },
-    { key:"completed",       label:"5. Completed",               icon:"✅", color:"#3b82f6", desc:"All teams have reviewed and submitted" },
-  ];
-
-  const total=boqs.length;
-  const completed=boqs.filter(b=>b.status==="completed").length;
-  const inProgress=boqs.filter(b=>b.status!=="draft"&&b.status!=="completed").length;
-  const drafts=boqs.filter(b=>b.status==="draft").length;
-
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:22}}>
-        <h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700}}>📊 Reports</h1>
-        <p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>
-          {isPlan?"Full approval pipeline overview — click any stage to see its BOQs":"Click any status to view the BOQs at that stage"}
-        </p>
-      </div>
-
-      {/* Summary strip */}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:24}}>
-        {[
-          {label:"Total BOQs",    value:total,      color:"var(--plan)"},
-          {label:"In Progress",   value:inProgress, color:"var(--amber)"},
-          {label:"Completed",     value:completed,  color:"var(--green)"},
-          {label:"Drafts",        value:drafts,     color:"var(--muted)"},
-        ].map(s=>(
-          <div key={s.label} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12,padding:"14px 16px",textAlign:"center"}}>
-            <div style={{fontSize:26,fontWeight:800,fontFamily:"Sora",color:s.color}}>{s.value}</div>
-            <div style={{fontSize:12,color:"var(--muted)",marginTop:3}}>{s.label}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* Planning gets full pipeline view with flow arrows */}
-      {isPlan&&(
-        <>
-          <h3 style={{fontFamily:"Sora",fontSize:15,marginBottom:14,color:"var(--muted)",textTransform:"uppercase",letterSpacing:".06em",fontSize:11}}>Approval Pipeline</h3>
-          {/* Visual pipeline flow */}
-          <div style={{display:"flex",alignItems:"center",gap:0,marginBottom:20,overflowX:"auto",paddingBottom:4}}>
-            {PIPELINE.map((stage,i)=>{
-              const count=boqs.filter(b=>b.status===stage.key).length;
-              return(
-                <div key={stage.key} style={{display:"flex",alignItems:"center",flexShrink:0}}>
-                  <div onClick={()=>setActiveStatus(activeStatus===stage.key?null:stage.key)}
-                    style={{display:"flex",flexDirection:"column",alignItems:"center",padding:"12px 16px",borderRadius:12,background:activeStatus===stage.key?`${stage.color}20`:"var(--s2)",border:`2px solid ${activeStatus===stage.key?stage.color:"var(--border)"}`,cursor:"pointer",minWidth:110,transition:"all .2s",boxShadow:activeStatus===stage.key?`0 0 14px ${stage.color}30`:"none"}}
-                    onMouseEnter={e=>e.currentTarget.style.borderColor=`${stage.color}80`}
-                    onMouseLeave={e=>e.currentTarget.style.borderColor=activeStatus===stage.key?stage.color:"var(--border)"}>
-                    <div style={{fontSize:22,marginBottom:4}}>{stage.icon}</div>
-                    <div style={{fontSize:11,fontWeight:700,color:stage.color,textAlign:"center",lineHeight:1.3}}>{stage.label}</div>
-                    <div style={{fontSize:22,fontWeight:800,fontFamily:"Sora",color:stage.color,marginTop:4}}>{count}</div>
-                    <div style={{fontSize:10,color:"var(--muted)",marginTop:2}}>BOQ{count!==1?"s":""}</div>
-                  </div>
-                  {i<PIPELINE.length-1&&(
-                    <div style={{fontSize:18,color:"var(--border)",margin:"0 4px",flexShrink:0}}>→</div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </>
-      )}
-
-      {/* All status sections — clickable, expand inline */}
-      <h3 style={{fontFamily:"Sora",fontSize:11,color:"var(--muted)",textTransform:"uppercase",letterSpacing:".06em",marginBottom:12}}>
-        {isPlan?"All Stages — Click to Expand":"BOQs by Status — Click to Expand"}
-      </h3>
-      {Object.entries(STATUS_META).map(([k,m])=>(
-        <StatusSection
-          key={k}
-          statusKey={k}
-          meta={m}
-          boqs={boqs}
-          activeStatus={activeStatus}
-          setActiveStatus={setActiveStatus}
-          onSelect={onSelect}
-          users={users}
-        />
-      ))}
-    </div>
-  );
-}
-
-
-// ─── User Form Modal ─────────────────────────────────────────────────────────
-const DEPT_ROLES = [
-  { role:"planning",    label:"Project Control",        color:"#8b5cf6", icon:"📐" },
-  { role:"engineering", label:"Engineering Team",     color:"#10b981", icon:"⚙️" },
-  { role:"qs",          label:"Quantity Survey Team", color:"#f59e0b", icon:"📏" },
-  { role:"site",        label:"Project Team",            color:"#f43f5e", icon:"🏗️" },
-];
-
-const ALL_PAGES = [
-  { id:"dashboard", label:"Dashboard",          desc:"Main overview & stats" },
-  { id:"create",    label:"Create BOQ",         desc:"Create new BOQs (Planning only)" },
-  { id:"my-boqs",   label:"My BOQs / All BOQs", desc:"List and search BOQs" },
-  { id:"pending",   label:"Pending Review",     desc:"BOQs awaiting their review" },
-  { id:"reports",   label:"Reports",            desc:"Pipeline overview & analytics" },
-];
-
-// ─── Global BOQ Search ─────────────────────────────────────────────────────────
-const STATUS_COLOR={draft:"#64748b",with_engineering:"#3b9eff",with_qs:"#f0a030",with_site:"#8b5cf6",approved:"#22c55e",rejected:"#ef4444"};
-const STATUS_LABEL={draft:"Draft",with_engineering:"Engineering",with_qs:"QS",with_site:"Site",approved:"Approved",rejected:"Rejected"};
-
-function GlobalSearch({boqs,users,onSelectBoq}){
-  const [q,setQ]=useState("");
-  const [filter,setFilter]=useState("all"); // all | boqId | itemName | lineItemId
-  const [statusF,setStatusF]=useState("all");
-  const inputRef=useRef(null);
-
-  // Focus on mount
-  React.useEffect(()=>{ inputRef.current?.focus(); },[]);
-
-  const trimQ=q.trim().toLowerCase();
-
-  const results=useMemo(()=>{
-    if(!trimQ) return [];
-    const hits=[];
-    boqs.forEach(boq=>{
-      const creator=users.find(u=>u.id===boq.createdBy);
-      if(statusF!=="all"&&boq.status!==statusF) return;
-
-      // Match BOQ ID
-      const boqMatch=(filter==="all"||filter==="boqId")&&boq.boqId.toLowerCase().includes(trimQ);
-
-      // Match items
-      const matchedItems=[];
-      if(filter==="all"||filter==="itemName"||filter==="lineItemId"){
-        boq.items.forEach((item,idx)=>{
-          const nameMatch=(filter==="all"||filter==="itemName")&&(item.name||"").toLowerCase().includes(trimQ);
-          const lidMatch=(filter==="all"||filter==="lineItemId")&&(item.lineItemId||"").toLowerCase().includes(trimQ);
-          const labelMatch=(filter==="all")&&(item.label||"").toLowerCase().includes(trimQ);
-          if(nameMatch||lidMatch||labelMatch){
-            matchedItems.push({...item,_idx:idx,_matchedName:nameMatch||labelMatch,_matchedLid:lidMatch});
-          }
-        });
-      }
-
-      if(boqMatch||matchedItems.length>0){
-        hits.push({boq,creator,boqMatch,matchedItems});
-      }
-    });
-    return hits;
-  },[trimQ,filter,statusF,boqs,users]);
-
-  const totalItems=results.reduce((s,r)=>s+r.matchedItems.length,0);
-
-  const hl=(text,q)=>{
-    if(!q||!text) return text;
-    const idx=text.toLowerCase().indexOf(q.toLowerCase());
-    if(idx===-1) return text;
-    return <>{text.slice(0,idx)}<mark style={{background:"#f0a03060",color:"var(--text)",borderRadius:3,padding:"0 2px"}}>{text.slice(idx,idx+q.length)}</mark>{text.slice(idx+q.length)}</>;
-  };
-
-  return(
-    <div className="fade-in">
-      {/* Header */}
-      <div style={{marginBottom:24}}>
-        <h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:700,marginBottom:4}}>🔍 Global Search</h1>
-        <div style={{fontSize:13,color:"var(--muted)"}}>Search across all {boqs.length} BOQs and their line items</div>
-      </div>
-
-      {/* Search bar */}
-      <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:20,marginBottom:20}}>
-        <div style={{position:"relative",marginBottom:16}}>
-          <span style={{position:"absolute",left:14,top:"50%",transform:"translateY(-50%)",fontSize:18,pointerEvents:"none"}}>🔍</span>
-          <input ref={inputRef} value={q} onChange={e=>setQ(e.target.value)}
-            placeholder="Search by item name, BOQ ID, line item ID…"
-            style={{width:"100%",padding:"12px 16px 12px 44px",fontSize:15,borderRadius:10,border:"1px solid var(--border)",background:"var(--s2)",color:"var(--text)",outline:"none",boxSizing:"border-box",fontFamily:"inherit"}}
-          />
-          {q&&<button onClick={()=>setQ("")} style={{position:"absolute",right:12,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"var(--muted)",fontSize:18,cursor:"pointer",lineHeight:1}}>✕</button>}
-        </div>
-        {/* Filter row */}
-        <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-          <span style={{fontSize:12,color:"var(--muted)",marginRight:4}}>Search in:</span>
-          {[["all","All Fields"],["boqId","BOQ ID"],["itemName","Item Name"],["lineItemId","Line Item ID"]].map(([k,l])=>(
-            <button key={k} onClick={()=>setFilter(k)}
-              style={{fontSize:12,padding:"5px 12px",borderRadius:7,border:"1px solid var(--border)",background:filter===k?"var(--accent)":"var(--s2)",color:filter===k?"#fff":"var(--muted)",cursor:"pointer",fontWeight:filter===k?700:500}}>
-              {l}
-            </button>
-          ))}
-          <span style={{marginLeft:12,fontSize:12,color:"var(--muted)"}}>Status:</span>
-          <select value={statusF} onChange={e=>setStatusF(e.target.value)}
-            style={{fontSize:12,padding:"5px 10px",borderRadius:7,border:"1px solid var(--border)",background:"var(--s2)",color:"var(--text)",cursor:"pointer",outline:"none"}}>
-            <option value="all">All Statuses</option>
-            {Object.entries(STATUS_LABEL).map(([k,l])=><option key={k} value={k}>{l}</option>)}
-          </select>
-        </div>
-      </div>
-
-      {/* Results count */}
-      {trimQ&&(
-        <div style={{fontSize:13,color:"var(--muted)",marginBottom:14,display:"flex",alignItems:"center",gap:8}}>
-          {results.length===0
-            ? <span>No results for <strong style={{color:"var(--text)"}}>"{q}"</strong></span>
-            : <><span style={{color:"var(--accent)",fontWeight:700}}>{results.length}</span> BOQ{results.length!==1?"s":""} matched
-              {totalItems>0&&<> · <span style={{color:"#10b981",fontWeight:700}}>{totalItems}</span> line item{totalItems!==1?"s":""}</>}
-              {" "}for <strong style={{color:"var(--text)"}}>"{q}"</strong>
-            </>}
-        </div>
-      )}
-
-      {/* Results */}
-      {!trimQ&&(
-        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--muted)"}}>
-          <div style={{fontSize:48,marginBottom:12}}>🔍</div>
-          <div style={{fontSize:15,fontWeight:600,marginBottom:8}}>Start typing to search</div>
-          <div style={{fontSize:13}}>Search by item name, BOQ ID, line item ID or label across all BOQs</div>
-        </div>
-      )}
-
-      <div style={{display:"flex",flexDirection:"column",gap:12}}>
-        {results.map(({boq,creator,boqMatch,matchedItems})=>{
-          const sc=STATUS_COLOR[boq.status]||"#64748b";
-          const sl=STATUS_LABEL[boq.status]||boq.status;
-          return(
-            <div key={boq.id} style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:12}}>
-              {/* BOQ header row */}
-              <div style={{display:"flex",alignItems:"center",gap:12,padding:"13px 16px",borderBottom:matchedItems.length>0?"1px solid var(--border)":"none",cursor:"pointer",background:boqMatch?"var(--s2)":"transparent",borderRadius:matchedItems.length>0?"12px 12px 0 0":"12px"}}
-                onClick={()=>onSelectBoq(boq)}
-                onMouseEnter={e=>e.currentTarget.style.background="var(--s3)"}
-                onMouseLeave={e=>e.currentTarget.style.background=boqMatch?"var(--s2)":"transparent"}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
-                    <span style={{fontFamily:"monospace",fontSize:13,fontWeight:700,color:"var(--text)"}}>{hl(boq.boqId,filter==="all"||filter==="boqId"?trimQ:"")}</span>
-                    <span style={{fontSize:10,fontWeight:700,color:sc,background:sc+"18",border:`1px solid ${sc}40`,borderRadius:5,padding:"2px 7px"}}>{sl}</span>
-                    {boqMatch&&<span style={{fontSize:10,color:"#f0a030",background:"#f0a03018",border:"1px solid #f0a03040",borderRadius:5,padding:"2px 7px"}}>BOQ ID match</span>}
-                  </div>
-                  <div style={{fontSize:11,color:"var(--muted)"}}>
-                    {creator?.name||"Unknown"} · {new Date(boq.createdAt).toLocaleDateString("en-IN")} · {boq.items.length} items
-                    {matchedItems.length>0&&<span style={{marginLeft:8,color:"#10b981",fontWeight:600}}>{matchedItems.length} item{matchedItems.length!==1?"s":""} matched</span>}
-                  </div>
-                </div>
-                <span style={{color:"var(--muted)",fontSize:13}}>Open →</span>
-              </div>
-
-              {/* Matched line items */}
-              {matchedItems.length>0&&(
-                <div>
-                  <div style={{overflowX:"auto",borderRadius:"0 0 12px 12px"}}>
-                  {/* column header */}
-                  <div style={{display:"grid",gridTemplateColumns:"110px 70px 1fr 60px 80px 80px 80px 80px",gap:10,padding:"6px 16px",background:"var(--s2)",borderBottom:"1px solid var(--border)",minWidth:700}}>
-                    {["Line ID","Label","Item Name","Unit","Plan","Eng","QS","Site"].map(h=>(
-                      <span key={h} style={{fontSize:10,fontWeight:700,color:"var(--muted)",textTransform:"uppercase",letterSpacing:"0.07em",textAlign:["Plan","Eng","QS","Site"].includes(h)?"right":"left",whiteSpace:"nowrap"}}>{h}</span>
-                    ))}
-                  </div>
-                  {matchedItems.slice(0,10).map((item,i)=>(
-                    <div key={item.id} style={{display:"grid",gridTemplateColumns:"110px 70px 1fr 60px 80px 80px 80px 80px",gap:10,padding:"9px 16px",borderBottom:"1px solid var(--border)",alignItems:"center",background:i%2===0?"transparent":"var(--s2)",cursor:"pointer",minWidth:700}}
-                      onClick={()=>onSelectBoq(boq)}
-                      onMouseEnter={e=>e.currentTarget.style.background="var(--s3)"}
-                      onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"transparent":"var(--s2)"}>
-                      <span style={{fontFamily:"monospace",fontSize:11,color:item._matchedLid?"#f0a030":"var(--muted)",fontWeight:item._matchedLid?700:400,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{hl(item.lineItemId||"—",item._matchedLid?trimQ:"")}</span>
-                      <span style={{fontSize:11,color:"var(--muted)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{item.label||"—"}</span>
-                      <span style={{fontSize:12,color:"var(--text)",fontWeight:item._matchedName?600:400,lineHeight:1.4}}>{hl(item.name||"—",item._matchedName?trimQ:"")}</span>
-                      <span style={{fontSize:11,color:"var(--muted)",textAlign:"center",whiteSpace:"nowrap"}}>{item.unit||"—"}</span>
-                      {[item.planQty,item.engQty,item.qsQty,item.siteQty].map((v,qi)=>(
-                        <span key={qi} style={{fontSize:12,fontFamily:"monospace",textAlign:"right",color:v>0?"var(--text)":"var(--s3)",fontWeight:v>0?600:400,whiteSpace:"nowrap"}}>{v>0?v.toLocaleString("en-IN"):"—"}</span>
-                      ))}
-                    </div>
-                  ))}
-                  {matchedItems.length>10&&(
-                    <div style={{padding:"8px 16px",fontSize:11,color:"var(--muted)",textAlign:"center",cursor:"pointer",minWidth:700}} onClick={()=>onSelectBoq(boq)}>
-                      +{matchedItems.length-10} more — open BOQ to see all
-                    </div>
-                  )}
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// ─── QUOTATION COMPARISON SYSTEM ─────────────────────────────────────────────
-
-const RFQ_STORAGE_KEY="rfq_data_v1";
 const genRfqId=()=>"RFQ-"+Date.now().toString(36).toUpperCase().slice(-6);
 
 // In-memory store — persists within the session
@@ -4390,7 +3070,7 @@ function QuotationsPage({user,vendorUsers}){
           <p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>Create RFQs, collect vendor quotes, compare & shortlist</p>
         </div>
         <button onClick={()=>setView("create")}
-          style={{padding:"10px 20px",background:"var(--accent)",border:"none",borderRadius:9,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:8}}>
+          style={{padding:"10px 20px",background:"var(--accent)",border:"none",borderRadius:9,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",gap:10}}>
           + New RFQ
         </button>
       </div>
@@ -4540,7 +3220,7 @@ function RFQCreateForm({vendorUsers,onSave,onCancel}){
           <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:8}}>
             Select Vendors * <span style={{fontSize:10,color:"var(--s3)",fontWeight:400,textTransform:"none"}}>(company policy: min 1, max 3)</span>
           </label>
-          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
             {vendorUsers.map(v=>{
               const sel=form.vendorEmails.includes(v.email);
               const disabled=!sel&&form.vendorEmails.length>=3;
@@ -4852,374 +3532,72 @@ function RFQDetail({rfq,vendorUsers,onBack,onDelete,onUpdate}){
 }
 
 // ── Vendor: My Quotations Page ────────────────────────────────────────────────
-function VendorQuotesPage({user}){
-  const [rfqs,setRfqs]=useState([]);
-  const [loading,setLoading]=useState(true);
-  const [selRfq,setSelRfq]=useState(null);
-  const [submitted,setSubmitted]=useState(null);
 
-  useEffect(()=>{loadRfqs().then(r=>{setRfqs(r);setLoading(false);});},[]);
-
-  const myRfqs=rfqs.filter(r=>r.vendorEmails.includes(user.email));
-  const pending=myRfqs.filter(r=>!r.responses.find(res=>res.vendorEmail===user.email));
-  const done=myRfqs.filter(r=>r.responses.find(res=>res.vendorEmail===user.email));
-
-  const handleSubmit=async(rfqId,resp)=>{
-    const updated=rfqs.map(r=>{
-      if(r.id!==rfqId)return r;
-      const existing=r.responses.filter(res=>res.vendorEmail!==user.email);
-      // Mark negotiation as resubmitted if one exists
-      const negotiations=(r.negotiations||[]).map(n=>n.vendorEmail===user.email?{...n,status:"resubmitted"}:n);
-      return{...r,responses:[...existing,{...resp,vendorEmail:user.email,submittedAt:Date.now()}],negotiations};
-    });
-    setRfqs(updated);
-    await saveRfqs(updated);
-    setSelRfq(null);
-    setSubmitted(rfqId);
-    setTimeout(()=>setSubmitted(null),3000);
-  };
-
-  if(loading)return <div style={{padding:40,textAlign:"center",color:"var(--muted)"}}>Loading…</div>;
-
-  if(selRfq){
-    const live=rfqs.find(r=>r.id===selRfq.id)||selRfq;
-    const existing=live.responses.find(r=>r.vendorEmail===user.email);
-    return <VendorQuoteForm rfq={live} existing={existing} vendorName={user.name} user={user} onSubmit={(resp)=>handleSubmit(live.id,resp)} onBack={()=>setSelRfq(null)}/>;
-  }
-
-  return(
-    <div className="fade-in">
-      <div style={{marginBottom:22}}>
-        <h1 style={{fontFamily:"Sora",fontSize:22,fontWeight:800}}>🏭 My Quotations</h1>
-        <p style={{color:"var(--muted)",fontSize:13,marginTop:4}}>Logged in as <b style={{color:"#06b6d4"}}>{user.name}</b></p>
-      </div>
-
-      {submitted&&(
-        <div style={{background:"#22c55e15",border:"1px solid #22c55e40",borderRadius:10,padding:"12px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:18}}>✅</span>
-          <span style={{fontSize:13,fontWeight:600,color:"#22c55e"}}>Quote submitted successfully!</span>
-        </div>
-      )}
-
-      {myRfqs.length===0?(
-        <div style={{textAlign:"center",padding:"60px 20px",color:"var(--muted)"}}>
-          <div style={{fontSize:48,marginBottom:14}}>📭</div>
-          <div style={{fontSize:15,fontWeight:600,color:"var(--text)"}}>No RFQs assigned to you</div>
-          <p style={{fontSize:12,marginTop:6}}>Procurement will send you quotation requests here</p>
-        </div>
-      ):(
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          {pending.length>0&&<div style={{fontSize:11,fontWeight:700,color:"#f0a030",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:2}}>⏳ Pending — {pending.length}</div>}
-          {pending.map(r=>(
-            <div key={r.id} onClick={()=>setSelRfq(r)}
-              style={{background:"var(--surface)",border:"1px solid #f0a03040",borderRadius:12,padding:"16px 18px",cursor:"pointer",transition:"all .15s"}}
-              onMouseEnter={e=>{e.currentTarget.style.borderColor="#f0a030";e.currentTarget.style.boxShadow="0 2px 12px #0003";}}
-              onMouseLeave={e=>{e.currentTarget.style.borderColor="#f0a03040";e.currentTarget.style.boxShadow="none";}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-                <div>
-                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                    <span style={{fontFamily:"monospace",fontSize:11,color:"var(--muted)",background:"var(--s2)",padding:"2px 7px",borderRadius:5}}>{r.id}</span>
-                    <span style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>{r.itemName}</span>
-                  </div>
-                  <div style={{fontSize:11,color:"var(--muted)"}}>{r.quantity} {r.unit} · Deadline: {r.deadline||"—"}</div>
-                </div>
-                <div style={{textAlign:"right"}}>
-                  <div style={{fontSize:11,fontWeight:700,color:"#f0a030",background:"#f0a03015",padding:"4px 12px",borderRadius:20,border:"1px solid #f0a03030",marginBottom:4}}>Submit Quote →</div>
-                </div>
-              </div>
-            </div>
-          ))}
-
-          {done.length>0&&<div style={{fontSize:11,fontWeight:700,color:"#22c55e",textTransform:"uppercase",letterSpacing:"0.08em",marginTop:10,marginBottom:2}}>✓ Submitted — {done.length}</div>}
-          {done.map(r=>{
-            const resp=r.responses.find(res=>res.vendorEmail===user.email);
-            return(
-              <div key={r.id} onClick={()=>setSelRfq(r)}
-                style={{background:"var(--surface)",border:"1px solid #22c55e30",borderRadius:12,padding:"16px 18px",cursor:"pointer",opacity:0.85}}
-                onMouseEnter={e=>{e.currentTarget.style.opacity="1";}} onMouseLeave={e=>{e.currentTarget.style.opacity="0.85";}}>
-                <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-                  <div>
-                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                      <span style={{fontFamily:"monospace",fontSize:11,color:"var(--muted)",background:"var(--s2)",padding:"2px 7px",borderRadius:5}}>{r.id}</span>
-                      <span style={{fontSize:14,fontWeight:700,color:"var(--text)"}}>{r.itemName}</span>
-                    </div>
-                    <div style={{fontSize:11,color:"var(--muted)"}}>{r.quantity} {r.unit} · Quoted: ₹{resp?.unitPrice?.toLocaleString("en-IN")} / {r.unit}</div>
-                  </div>
-                  <span style={{fontSize:11,color:"#22c55e",fontWeight:700}}>✓ Submitted</span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Vendor Quote Form ─────────────────────────────────────────────────────────
-function VendorQuoteForm({rfq,existing,vendorName,user,onSubmit,onBack}){
-  const [form,setForm]=useState({
-    unitPrice:existing?.unitPrice||"",
-    deliveryDays:existing?.deliveryDays||"",
-    validity:existing?.validity||"30 days",
-    paymentTerms:existing?.paymentTerms||"",
-    brand:existing?.brand||"",
-    warranty:existing?.warranty||"",
-    remarks:existing?.remarks||"",
-  });
-  const [err,setErr]=useState("");
-  const [confirming,setConfirming]=useState(false);
-  const set=(k,v)=>setForm(p=>({...p,[k]:v}));
-
-  const submit=()=>{
-    if(!form.unitPrice||isNaN(form.unitPrice)||Number(form.unitPrice)<=0)return setErr("Enter a valid unit price.");
-    if(!form.deliveryDays||isNaN(form.deliveryDays))return setErr("Enter delivery days.");
-    setErr("");setConfirming(true);
-  };
-  const confirm=()=>onSubmit({...form,unitPrice:Number(form.unitPrice),deliveryDays:Number(form.deliveryDays)});
-
-  return(
-    <div className="fade-in" style={{maxWidth:640,margin:"0 auto"}}>
-      <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20}}>
-        <button onClick={onBack} style={{background:"none",border:"none",color:"var(--muted)",fontSize:20,cursor:"pointer",padding:0}}>←</button>
-        <div>
-          <h1 style={{fontFamily:"Sora",fontSize:19,fontWeight:800}}>Submit Quotation</h1>
-          <p style={{color:"var(--muted)",fontSize:12,marginTop:2}}>Filling as <b style={{color:"#06b6d4"}}>{vendorName}</b></p>
-        </div>
-      </div>
-
-      {/* RFQ summary */}
-      <div style={{background:"var(--surface)",border:"1px solid var(--accent)30",borderRadius:12,padding:"14px 16px",marginBottom:18}}>
-        <div style={{fontSize:10,fontWeight:700,color:"var(--accent)",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>Request Details</div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
-          {[["Item",rfq.itemName],["Quantity",`${rfq.quantity} ${rfq.unit}`],["Deadline",rfq.deadline||"—"],["RFQ ID",rfq.id]].map(([l,v])=>(
-            <div key={l}><span style={{fontSize:10,color:"var(--muted)"}}>{l}: </span><span style={{fontSize:12,fontWeight:600,color:"var(--text)"}}>{v}</span></div>
-          ))}
-        </div>
-        {rfq.specs&&<div style={{marginTop:10,padding:"8px 10px",background:"var(--s2)",borderRadius:7,fontSize:11,color:"var(--muted)",lineHeight:1.5}}><b style={{color:"var(--text)"}}>Specs:</b> {rfq.specs}</div>}
-      </div>
-
-      {/* Negotiation message from procurement */}
-      {(()=>{
-        const myNego=(rfq.negotiations||[]).find(n=>n.vendorEmail===user.email);
-        if(!myNego)return null;
-        return(
-          <div style={{background:"#3b82f615",border:"1px solid #3b82f640",borderRadius:12,padding:"14px 16px",marginBottom:18}}>
-            <div style={{fontSize:11,fontWeight:700,color:"#3b82f6",textTransform:"uppercase",letterSpacing:"0.08em",marginBottom:8}}>💬 Negotiation Message from Procurement</div>
-            {myNego.targetPrice&&<div style={{fontSize:12,color:"var(--text)",marginBottom:6}}>Target Price: <b style={{color:"#f0a030"}}>₹{Number(myNego.targetPrice).toLocaleString("en-IN")} / {rfq.unit}</b></div>}
-            <div style={{fontSize:12,color:"var(--text)",lineHeight:1.6,whiteSpace:"pre-wrap"}}>{myNego.message}</div>
-            <div style={{fontSize:10,color:"var(--muted)",marginTop:6}}>Sent: {new Date(myNego.sentAt).toLocaleDateString("en-GB",{day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})}</div>
-          </div>
-        );
-      })()}
-      <div style={{background:"var(--surface)",border:"1px solid var(--border)",borderRadius:14,padding:22,display:"flex",flexDirection:"column",gap:14}}>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Unit Price (₹) *</label>
-            <input value={form.unitPrice} onChange={e=>set("unitPrice",e.target.value)} type="number" placeholder="0.00"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-            {form.unitPrice>0&&<div style={{fontSize:11,color:"var(--muted)",marginTop:4}}>Total: ₹{(form.unitPrice*rfq.quantity).toLocaleString("en-IN")} for {rfq.quantity} {rfq.unit}</div>}
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Delivery Time (days) *</label>
-            <input value={form.deliveryDays} onChange={e=>set("deliveryDays",e.target.value)} type="number" placeholder="e.g. 14"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Quote Validity</label>
-            <input value={form.validity} onChange={e=>set("validity",e.target.value)} placeholder="e.g. 30 days"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Payment Terms</label>
-            <input value={form.paymentTerms} onChange={e=>set("paymentTerms",e.target.value)} placeholder="e.g. 30 days net"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Brand / Make</label>
-            <input value={form.brand} onChange={e=>set("brand",e.target.value)} placeholder="e.g. Havells, Polycab"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-          </div>
-          <div>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Warranty</label>
-            <input value={form.warranty} onChange={e=>set("warranty",e.target.value)} placeholder="e.g. 1 year"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",boxSizing:"border-box"}}/>
-          </div>
-          <div style={{gridColumn:"1/-1"}}>
-            <label style={{fontSize:11,color:"var(--muted)",fontWeight:700,textTransform:"uppercase",letterSpacing:"0.08em",display:"block",marginBottom:5}}>Remarks / Notes</label>
-            <textarea value={form.remarks} onChange={e=>set("remarks",e.target.value)} rows={2} placeholder="Any additional terms, exclusions, notes…"
-              style={{width:"100%",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,padding:"9px 12px",color:"var(--text)",fontSize:13,outline:"none",resize:"vertical",fontFamily:"inherit",boxSizing:"border-box"}}/>
-          </div>
-        </div>
-
-        {err&&<div style={{padding:"8px 12px",background:"#ef444415",border:"1px solid #ef444440",borderRadius:7,fontSize:12,color:"#ef4444"}}>{err}</div>}
-
-        {confirming?(
-          <div style={{background:"#f0a03015",border:"1px solid #f0a03040",borderRadius:10,padding:"14px 16px"}}>
-            <div style={{fontSize:13,fontWeight:700,color:"#f0a030",marginBottom:8}}>⚠ Confirm Submission</div>
-            <div style={{fontSize:12,color:"var(--muted)",marginBottom:12}}>Once submitted, your quote will be shared with the procurement team. You can update it by re-submitting.</div>
-            <div style={{display:"flex",gap:8}}>
-              <button onClick={confirm} style={{flex:1,padding:"10px",background:"#22c55e",border:"none",borderRadius:8,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>✓ Confirm & Submit</button>
-              <button onClick={()=>setConfirming(false)} style={{padding:"10px 16px",background:"var(--s2)",border:"1px solid var(--border)",borderRadius:8,color:"var(--muted)",fontWeight:600,fontSize:13,cursor:"pointer"}}>Cancel</button>
-            </div>
-          </div>
-        ):(
-          <button onClick={submit} style={{padding:"12px",background:"var(--accent)",border:"none",borderRadius:9,color:"#fff",fontWeight:700,fontSize:13,cursor:"pointer"}}>
-            Review & Submit Quote →
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
 export default function App(){
   const [user,setUser]=useState(null);
-  const [page,setPage]=useState("dashboard");
-  const [sel,setSel]=useState(null);
-  const [notifs,setNotifs]=useState({});
-  const [users,setUsers]=useState(INITIAL_USERS);
-  const [theme, setTheme]=useState("dark");
+  const [page,setPage] = useState("dashboard");
+  const [theme, setTheme] = useState("dark");
+  const [users,setUsers]=useState([]);
 
   useEffect(()=>{
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
 
-  const [boqs,setBoqs]=useState([
-    {
-      id:1,boqId:"BOQ-DEMO01",createdBy:1,createdAt:Date.now()-86400000*4,
-      status:"with_engineering",
-      items:[
-        {id:1,lineItemId:"2422849",label:"1.1.1",name:"RING MAIN UNIT- 11kV 5 Mod INDOOR TYPE IP-4X",unit:"No's",planQty:1,engQty:0,qsQty:0,siteQty:0},
-        {id:2,lineItemId:"2422853",label:"1.1.2",name:"Earthing Truck (Busbar Side) with single phase PT and audio-visual alarm, safety interlock features",unit:"No's",planQty:2,engQty:0,qsQty:0,siteQty:0},
-        {id:3,lineItemId:"2422882",label:"1.3.1",name:"3C X 300Sq.mm XLPE insulated Al. Ar. - Earthed type, FRLS HT Cable 11kV grade as per IS-7098 Part-2",unit:"Mtrs.",planQty:45,engQty:0,qsQty:0,siteQty:0},
-      ],
-      activityLog:[{time:Date.now()-86400000*4,user:"user_1",action:"Submitted to Engineering Team"}],
-    },
-    {
-      id:2,boqId:"BOQ-DEMO02",createdBy:1,createdAt:Date.now()-86400000*3,
-      status:"with_qs",
-      items:[
-        {id:1,lineItemId:"2423001",label:"5.1.1",name:"3.5C x 300 sq.mm Al. Ar. XLPE cable - FRLS",unit:"R.Mtrs",planQty:2400,engQty:2200,qsQty:0,siteQty:0},
-        {id:2,lineItemId:"2423002",label:"5.1.2",name:"End Termination for above",unit:"Sets",planQty:64,engQty:60,qsQty:0,siteQty:0},
-      ],
-      activityLog:[
-        {time:Date.now()-86400000*3,user:"user_1",action:"Submitted to Engineering Team"},
-        {time:Date.now()-86400000*2,user:"Engineering Team",action:"Engineering quantities submitted — forwarded to Quantity Survey Team"},
-      ],
-    },
-    {
-      id:3,boqId:"BOQ-DEMO03",createdBy:1,createdAt:Date.now()-86400000*2,
-      status:"with_site",
-      items:[
-        {id:1,lineItemId:"2422932",label:"2.1",name:"Main LT Panel - with automatic NOVEC-1230 flooding system",unit:"No's",planQty:1,engQty:1,qsQty:1,siteQty:0},
-        {id:2,lineItemId:"2422933",label:"2.2",name:"ACCP PANEL-1 & 2 IP 4X AS PER SINGLE LINE DIAGRAM",unit:"No's",planQty:2,engQty:3,qsQty:2,siteQty:0},
-        {id:3,lineItemId:"2422934",label:"2.3",name:"UTILITY PANEL IP 54 AS PER SINGLE LINE DIAGRAM",unit:"No's",planQty:1,engQty:1,qsQty:1,siteQty:0},
-      ],
-      activityLog:[
-        {time:Date.now()-86400000*2,user:"user_1",action:"Submitted to Engineering Team"},
-        {time:Date.now()-86400000*1.5,user:"Engineering Team",action:"Engineering quantities submitted — forwarded to Quantity Survey Team"},
-        {time:Date.now()-86400000,user:"Quantity Survey Team",action:"QS quantities submitted — forwarded to Project Team"},
-      ],
-    },
-  ]);
-
-  const myNotifs=user?(notifs[user.id]||[]):[];
-  const vendorUsers=users.filter(u=>u.role==="vendor");
-
-  const push=(uid,notif)=>setNotifs(p=>({...p,[uid]:[...(p[uid]||[]),{id:Date.now(),...notif}]}));
-  const clearNotifs=()=>setNotifs(p=>({...p,[user.id]:(p[user.id]||[]).map(n=>({...n,read:true}))}));
-  const addBoq=boq=>{setBoqs(p=>[...p,boq]);setPage("my-boqs");};
-
-  const updateBoq=(updated,event)=>{
-    setBoqs(p=>p.map(b=>b.id===updated.id?updated:b));
-    setSel(updated);
-    const planUser=users.find(u=>u.role==="planning");
-    const engUser=users.find(u=>u.role==="engineering");
-    const qsUser=users.find(u=>u.role==="qs");
-    const siteUser=users.find(u=>u.role==="site");
-
-    if(event==="engineering_submitted"){
-      const diff=updated.items.filter(i=>i.engQty!==i.planQty).length;
-      push(planUser.id,{icon:"⚙️",read:false,time:Date.now(),message:`Engineering reviewed ${updated.boqId}. ${diff} item${diff!==1?"s have":" has"} quantity differences. Forwarded to QS Team.`});
-      push(qsUser.id,{icon:"📋",read:false,time:Date.now(),message:`${updated.boqId} assigned to you. Engineering quantities are ready — please enter QS quantities.`});
-    }
-    if(event==="qs_submitted"){
-      const diff=updated.items.filter(i=>i.qsQty!==i.engQty).length;
-      push(planUser.id,{icon:"📏",read:false,time:Date.now(),message:`QS Team reviewed ${updated.boqId}. ${diff} item${diff!==1?"s differ":" differs"} between QS and Engineering. Forwarded to Project Team.`});
-      push(siteUser.id,{icon:"🏗️",read:false,time:Date.now(),message:`${updated.boqId} assigned to you. QS quantities are complete — please enter Site quantities.`});
-    }
-    if(event==="site_submitted"){
-      const diff=updated.items.filter(i=>i.siteQty!==i.engQty).length;
-      push(planUser.id,{icon:"🏗️",read:false,time:Date.now(),message:`Project Team completed ${updated.boqId}. ${diff} item${diff!==1?"s differ":" differs"} between Site and Engineering. BOQ is now fully Completed.`});
-      push(engUser.id,{icon:"✅",read:false,time:Date.now(),message:`${updated.boqId} has been completed by the Project Team.`});
-      push(qsUser.id,{icon:"✅",read:false,time:Date.now(),message:`${updated.boqId} has been completed by the Project Team.`});
+  const fetchUserProfile = async (authUser) => {
+    const { data } = await supabase.from('profiles').select('*').eq('id', authUser.id).single();
+    if(data) {
+      setUser({
+        id: data.id,
+        email: data.email,
+        name: data.name || data.email.split('@')[0],
+        role: data.role,
+        active: data.role !== 'disabled'
+      });
     }
   };
+
+  
+
+  const fetchBoqs = () => {};
+
+  const fetchAllUsers = async () => {
+    const { data } = await supabase.from('profiles').select('*');
+    if(data) setUsers(data);
+  };
+
+  useEffect(() => {
+    if(user) {
+      fetchBoqs();
+      fetchAllUsers();
+    }
+  }, [user]);
+
+  const vendorUsers = users.filter(u => u.role === "vendor");
 
   if(!user) return <><style>{G}</style><LoginScreen onLogin={u=>{setUser(u);setPage(u.role==="vendor"?"quotes":"dashboard");}} users={users} theme={theme} toggleTheme={()=>setTheme(t=>t==="dark"?"light":"dark")}/></>;
 
   // Helper: can user access this page?
   const canAccess=pg=>!user.pages||user.pages.includes(pg);
 
-  const render=()=>{
-    // ── BOQ detail views ──
-    if(sel){
-      if(user.role==="planning")    return <PlanningView    boq={sel} onBack={()=>setSel(null)} onUpdateBoq={(updated)=>{setBoqs(p=>p.map(b=>b.id===updated.id?updated:b));setSel(updated);}}/>;
-      if(user.role==="engineering") return <EngineeringView boq={sel} onUpdate={updateBoq} onBack={()=>setSel(null)}/>;
-      if(user.role==="qs")          return <QSView          boq={sel} onUpdate={updateBoq} onBack={()=>setSel(null)}/>;
-      if(user.role==="site")        return <SiteView        boq={sel} onUpdate={updateBoq} onBack={()=>setSel(null)} users={users}/>;
+  const render = () => {
+    if (user.role === "procurement") {
+      if (page === "quotations") return <QuotationsPage user={user} vendorUsers={vendorUsers} />;
+      return <ProcurementDashboard />;
     }
-    if(user.role==="planning"){
-      if(page==="dashboard"&&canAccess("dashboard")) return <PlanningDash boqs={boqs} user={user} setPage={setPage} notifications={myNotifs}/>;
-      if(page==="create"&&canAccess("create"))       return <BOQCreator onSave={addBoq} user={user}/>;
-      if(page==="my-boqs"&&canAccess("my-boqs"))     return <BOQList boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="search")                            return <GlobalSearch boqs={boqs} users={users} onSelectBoq={b=>{setSel(b);setPage("dashboard");}}/>;
-      if(page==="reports"&&canAccess("reports"))     return <Reports boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-    }
-    if(user.role==="engineering"){
-      if(page==="dashboard"&&canAccess("dashboard")) return <Dashboard user={user} boqs={boqs} setPage={setPage} notifications={myNotifs} pendingStatus="with_engineering" pendingLabel="Enter engineering quantities for given line items"/>;
-      if(page==="pending"&&canAccess("pending"))     return <BOQList boqs={boqs} user={user} filterStatus="with_engineering" onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="my-boqs"&&canAccess("my-boqs"))     return <BOQList boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="search")                            return <GlobalSearch boqs={boqs} users={users} onSelectBoq={b=>{setSel(b);setPage("dashboard");}}/>;
-      if(page==="reports"&&canAccess("reports"))     return <Reports boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-    }
-    if(user.role==="qs"){
-      if(page==="dashboard"&&canAccess("dashboard")) return <Dashboard user={user} boqs={boqs} setPage={setPage} notifications={myNotifs} pendingStatus="with_qs" pendingLabel="Enter QS quantities and compare with Engineering"/>;
-      if(page==="pending"&&canAccess("pending"))     return <BOQList boqs={boqs} user={user} filterStatus="with_qs" onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="my-boqs"&&canAccess("my-boqs"))     return <BOQList boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="search")                            return <GlobalSearch boqs={boqs} users={users} onSelectBoq={b=>{setSel(b);setPage("dashboard");}}/>;
-      if(page==="reports"&&canAccess("reports"))     return <Reports boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-    }
-    if(user.role==="site"){
-      if(page==="dashboard"&&canAccess("dashboard")) return <Dashboard user={user} boqs={boqs} setPage={setPage} notifications={myNotifs} pendingStatus="with_site" pendingLabel="Enter site quantities and compare with Engineering"/>;
-      if(page==="pending"&&canAccess("pending"))     return <BOQList boqs={boqs} user={user} filterStatus="with_site" onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="my-boqs"&&canAccess("my-boqs"))     return <BOQList boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-      if(page==="search")                            return <GlobalSearch boqs={boqs} users={users} onSelectBoq={b=>{setSel(b);setPage("dashboard");}}/>;
-      if(page==="reports"&&canAccess("reports"))     return <Reports boqs={boqs} user={user} onSelect={b=>setSel(b)} users={users}/>;
-    }
-    // ── Vendor routes ──
-    if(user.role==="vendor") return <VendorQuotesPage user={user}/>;
-    // ── Procurement routes ──
-    if(user.role==="procurement"){
-      if(page==="quotations") return <QuotationsPage user={user} vendorUsers={vendorUsers}/>;
-      if(canAccess("procurement")) return <ProcurementDashboard/>;
-    }
-    // No access fallback
-    return <div style={{textAlign:"center",padding:"80px 20px",color:"var(--muted)"}}><div style={{fontSize:48,marginBottom:16}}>🚫</div><div style={{fontSize:18,fontWeight:600}}>Access Denied</div><p style={{marginTop:8}}>You don't have permission to view this page.</p></div>;
+    return null;
   };
 
   return(
     <>
       <style>{G}</style>
       <div style={{display:"flex",minHeight:"100vh"}}>
-        <Sidebar user={user} page={page} setPage={p=>{setPage(p);setSel(null);}} onLogout={()=>{setUser(null);setSel(null);setPage("dashboard");}} boqs={boqs} theme={theme} toggleTheme={()=>setTheme(t=>t==="dark"?"light":"dark")}/>
+        <Sidebar user={user} page={page} setPage={setPage} onLogout={()=>{setUser(null);setPage("dashboard");}} boqs={[]} theme={theme} toggleTheme={()=>setTheme(t=>t==="dark"?"light":"dark")}/>
         <main style={{flex:1,padding:28,overflowY:"auto",background:"var(--bg)",position:"relative"}}>
-          <div style={{position:"absolute",top:20,right:28,zIndex:999,display:user.role==="procurement"?"none":"block"}}>
-            <NotifBell notifications={myNotifs} onClear={clearNotifs}/>
-          </div>
+          
           {render()}
         </main>
       </div>
     </>
   );
 }
+
